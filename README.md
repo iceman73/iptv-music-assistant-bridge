@@ -64,6 +64,24 @@ curl http://YOUR-BRIDGE-HOST:8088/health
 
 The default bridge port is **8088**.
 
+### Docker base image mirror
+
+The project defaults Docker builds to Google's Docker Hub mirror:
+
+```text
+mirror.gcr.io/library/python:3.12-slim
+```
+
+This avoids unnecessary failures when Docker Hub's authentication service is unavailable or rate-limited. The same default is used by local Docker Compose builds and GitHub Actions.
+
+If you explicitly want to use Docker Hub instead, override the build argument when starting the stack:
+
+```bash
+BASE_IMAGE=python:3.12-slim docker compose up -d --build
+```
+
+No change to your local `.env` is required for the mirror default.
+
 To update later:
 
 ```bash
