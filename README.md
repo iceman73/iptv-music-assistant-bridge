@@ -35,6 +35,28 @@ Current release: **v5.5**
 
 For the recommended configuration, Dispatcharr should output audio-only **AAC-LC, 128 kbps, 48 kHz, stereo**.
 
+## Published Docker image
+
+Successful builds on `main` are published automatically to GitHub Container Registry:
+
+```text
+ghcr.io/iceman73/iptv-music-assistant-bridge:latest
+```
+
+Each published build also receives an immutable commit tag in the form:
+
+```text
+ghcr.io/iceman73/iptv-music-assistant-bridge:sha-<git-commit>
+```
+
+Pull the current published image with:
+
+```bash
+docker pull ghcr.io/iceman73/iptv-music-assistant-bridge:latest
+```
+
+Pull requests are tested and built, but are not published.
+
 ## Installation
 
 Clone the repository:
@@ -67,7 +89,7 @@ The default bridge port is **8088**.
 The Docker Compose project explicitly names the local image:
 
 ```text
-iceman73/iptv-music-assistant-bridge:latest
+ghcr.io/iceman73/iptv-music-assistant-bridge:latest
 ```
 
 The container name remains `dispatcharr-ma-bridge`.
