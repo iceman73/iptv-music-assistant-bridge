@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.3")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.4")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -116,6 +116,12 @@ STREAM_LINGER_SECONDS = max(0.0, float(os.getenv("STREAM_LINGER_SECONDS", "30"))
 STREAM_SUBSCRIBER_QUEUE_CHUNKS = max(4, int(os.getenv("STREAM_SUBSCRIBER_QUEUE_CHUNKS", "16")))
 STREAM_RESTART_DELAY = max(0.25, float(os.getenv("STREAM_RESTART_DELAY", "1")))
 STREAM_READ_CHUNK_BYTES = max(1024, int(os.getenv("STREAM_READ_CHUNK_BYTES", "16384")))
+# FFmpeg often returns tiny encoded reads even when read() requests 16 KB. Coalesce
+# those small reads before fan-out so clients receive steadier internet-radio-sized
+# writes. This does not alter codec frames or audio timing; it only changes network
+# write granularity. A short max delay prevents extra latency on low-bitrate streams.
+STREAM_COALESCE_BYTES = max(0, int(os.getenv("STREAM_COALESCE_BYTES", "8192")))
+STREAM_COALESCE_MAX_SECONDS = max(0.0, float(os.getenv("STREAM_COALESCE_MAX_SECONDS", "0.50")))
 STREAM_RING_BUFFER_SECONDS = max(0.0, float(os.getenv("STREAM_RING_BUFFER_SECONDS", "2")))
 UPSTREAM_RETRY_INITIAL_SECONDS = max(0.25, float(os.getenv("UPSTREAM_RETRY_INITIAL_SECONDS", "1")))
 UPSTREAM_RETRY_MAX_SECONDS = max(UPSTREAM_RETRY_INITIAL_SECONDS, float(os.getenv("UPSTREAM_RETRY_MAX_SECONDS", "5")))
@@ -536,6 +542,63 @@ def _existing_radio_name(item: dict[str, Any]) -> str:
     return str(item.get("name") or "").strip()
 
 
+async def coalesce_audio_chunks(
+    source: AsyncIterator[tuple[bytes, bool]],
+    target_bytes: int | None = None,
+    max_delay_seconds: float | None = None,
+) -> AsyncIterator[tuple[bytes, bool]]:
+    """Coalesce tiny encoded FFmpeg reads into steadier client writes.
+
+    FFmpeg's asyncio pipe may return a few hundred bytes even when read() asks for
+    much more. Broadcasting every tiny read produces bursty HTTP delivery that
+    browsers tolerate well but some hardware radio clients do not. Keep encoded
+    bytes untouched and only group adjacent chunks with the same real/silence
+    classification. State transitions and stream end always flush immediately.
+    """
+    target = STREAM_COALESCE_BYTES if target_bytes is None else max(0, int(target_bytes))
+    max_delay = STREAM_COALESCE_MAX_SECONDS if max_delay_seconds is None else max(0.0, float(max_delay_seconds))
+    if target <= 0:
+        async for chunk, real_audio in source:
+            if chunk:
+                yield chunk, real_audio
+        return
+
+    pending = bytearray()
+    pending_real: bool | None = None
+    pending_since = 0.0
+
+    async for chunk, real_audio in source:
+        if not chunk:
+            continue
+        now = time.monotonic()
+
+        # Never combine startup silence and real audio in one network write.
+        if pending and pending_real is not None and real_audio != pending_real:
+            yield bytes(pending), pending_real
+            pending.clear()
+            pending_real = None
+            pending_since = 0.0
+
+        if not pending:
+            pending_real = real_audio
+            pending_since = now
+        pending.extend(chunk)
+
+        while len(pending) >= target:
+            yield bytes(pending[:target]), bool(pending_real)
+            del pending[:target]
+            pending_since = now if pending else 0.0
+
+        if pending and max_delay > 0 and (now - pending_since) >= max_delay:
+            yield bytes(pending), bool(pending_real)
+            pending.clear()
+            pending_real = None
+            pending_since = 0.0
+
+    if pending:
+        yield bytes(pending), bool(pending_real)
+
+
 class SharedStreamHub:
     """One persistent upstream encoder shared by every listener of a channel/format."""
 
@@ -701,15 +764,20 @@ class SharedStreamHub:
                 self.real_audio_ready.clear()
                 self.last_real_audio_at = ""
                 try:
-                    async for chunk in startup_protected_audio_stream(
-                        self.channel,
-                        self.fmt,
-                        real_audio_event=self.real_audio_ready,
-                        diagnostic_callback=self.record_upstream_event,
-                    ):
-                        if self.real_audio_ready.is_set() and not self.last_real_audio_at:
-                            self.last_real_audio_at = utc_now_iso()
-                        await self._broadcast(chunk, real_audio=self.real_audio_ready.is_set())
+                    async def tagged_stream() -> AsyncIterator[tuple[bytes, bool]]:
+                        async for chunk in startup_protected_audio_stream(
+                            self.channel,
+                            self.fmt,
+                            real_audio_event=self.real_audio_ready,
+                            diagnostic_callback=self.record_upstream_event,
+                        ):
+                            real_audio = self.real_audio_ready.is_set()
+                            if real_audio and not self.last_real_audio_at:
+                                self.last_real_audio_at = utc_now_iso()
+                            yield chunk, real_audio
+
+                    async for chunk, real_audio in coalesce_audio_chunks(tagged_stream()):
+                        await self._broadcast(chunk, real_audio=real_audio)
                     self.last_error = "upstream stream ended"
                 except asyncio.CancelledError:
                     raise
@@ -847,6 +915,8 @@ class SharedStreamHub:
             "subscriber_queue_capacity": STREAM_SUBSCRIBER_QUEUE_CHUNKS,
             "max_queue_depth": self.max_queue_depth,
             "avg_chunk_bytes": round(self.total_output_bytes / self.total_chunks, 1) if self.total_chunks else 0.0,
+            "coalesce_bytes": STREAM_COALESCE_BYTES,
+            "coalesce_max_seconds": STREAM_COALESCE_MAX_SECONDS,
             "ring_buffer_seconds": STREAM_RING_BUFFER_SECONDS,
             "ring_buffer_chunks": len(self._ring_buffer),
             "upstream_http_503_count": self.upstream_http_503_count,
@@ -1542,7 +1612,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.3"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.4"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -1621,7 +1691,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.3.0", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.4.0", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2138,10 +2208,12 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.3.0",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.4.0",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
+        "stream_coalesce_bytes": STREAM_COALESCE_BYTES,
+        "stream_coalesce_max_seconds": STREAM_COALESCE_MAX_SECONDS,
         "streams": stream_manager.status(),
     }
 
