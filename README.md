@@ -1,15 +1,16 @@
 # IPTV Music Assistant Bridge
 
-A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio channels into radio streams that Music Assistant can use reliably.
+A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio channels into radio streams that Music Assistant can use reliably, with MP3 defaults selected for improved Amazon Echo compatibility.
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.4**
+Current release: **v5.5**
 
 ## Features
 
 - Dispatcharr M3U or Xtream Codes / XC source support
 - AAC and MP3 radio endpoints for Music Assistant
+- MP3 is the default output/import format for improved Amazon Echo compatibility
 - Shared upstream stream per channel and format
 - Coalesced 8 KB client writes to smooth tiny FFmpeg pipe reads
 - Configurable upstream connection limit
@@ -151,8 +152,8 @@ GROUP_FILTER=SiriusXM
 
 # Bridge
 PUBLIC_BASE_URL=http://YOUR-BRIDGE-HOST:8088
-DEFAULT_FORMAT=aac
-IMPORT_FORMAT=aac
+DEFAULT_FORMAT=mp3
+IMPORT_FORMAT=mp3
 
 # Audio
 AAC_MODE=copy
@@ -194,7 +195,7 @@ MA_REMOVE_MISSING=false
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PUBLIC_BASE_URL` | `http://localhost:8088` | URL Music Assistant uses to reach the bridge |
-| `DEFAULT_FORMAT` | `aac` | Default playlist format: `aac` or `mp3` |
+| `DEFAULT_FORMAT` | `mp3` | Default playlist format: `mp3` for improved Amazon Echo compatibility; `aac` remains available |
 | `IMPORT_FORMAT` | same as default | Format imported into Music Assistant |
 | `AAC_MODE` | `auto` | `copy`, `auto`, or transcode behavior |
 | `AAC_BITRATE` | `128k` | AAC bitrate when transcoding |
@@ -287,6 +288,22 @@ shared encoded stream hub
 ```
 
 FFmpeg owns normal upstream HTTP reconnects. The bridge does not intentionally kill and respawn FFmpeg because of a short gap in received audio. When the last listener disconnects, the hub remains available for `STREAM_LINGER_SECONDS` before the upstream is closed.
+
+### Amazon Echo compatibility
+
+Starting with v5.5, the bridge defaults to **MP3** for both generated playlists and Music Assistant imports. This is specifically intended to improve compatibility with Amazon Echo devices, which can be less tolerant than browser players of raw AAC/ADTS timing, transcoding, and small/bursty stream writes.
+
+The recommended Echo-facing defaults are:
+
+```env
+DEFAULT_FORMAT=mp3
+IMPORT_FORMAT=mp3
+MP3_BITRATE=192k
+STREAM_COALESCE_BYTES=8192
+STREAM_COALESCE_MAX_SECONDS=0.50
+```
+
+AAC endpoints remain available. If you explicitly prefer AAC for another player, set `DEFAULT_FORMAT=aac` and/or `IMPORT_FORMAT=aac`.
 
 ## Music Assistant setup
 
