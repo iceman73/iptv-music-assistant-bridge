@@ -1,268 +1,423 @@
-# Dispatcharr → Music Assistant Bridge v5.3
+# IPTV Music Assistant Bridge
 
-v5.3 is based on the **standalone v5.0 playback architecture** and adds fast, free
-SiriusXM now-playing metadata using the same bulk feeds used by the current
-Dispatcharr Ticker plugin.
+A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio channels into radio streams that Music Assistant can use reliably.
 
-## What stays from v5.0
+The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-The playback core is intentionally unchanged in principle:
+Current release: **v5.3**
 
-- one shared hub per channel + output format
-- one FFmpeg process per active hub
-- FFmpeg owns HTTP reconnects internally
-- the bridge respawns FFmpeg only after the process exits and demand remains
-- no playback stall → kill → respawn loop
-- maximum upstream connections defaults to 2
-- 30-second playback linger
-- startup silence for cold Dispatcharr streams
-- sequential Music Assistant imports
-- import pin/release grace
-- persistent channel catalog cache in `/data/bridge-cache.json`
+## Features
 
-This is the v5 behavior that avoids repeated Dispatcharr connect/disconnect churn.
+- Dispatcharr M3U or Xtream Codes / XC source support
+- AAC and MP3 radio endpoints for Music Assistant
+- Shared upstream stream per channel and format
+- Configurable upstream connection limit
+- 30-second hot-stream linger to avoid unnecessary reconnects
+- Startup silence while a cold IPTV stream opens
+- AAC copy mode when Dispatcharr already provides AAC
+- Optional SiriusXM now-playing metadata
+- Ticker-compatible free SiriusXM metadata source
+- xmplaylist fallback
+- Optional ICY artist/title injection
+- Automatic Music Assistant radio synchronization
+- Persistent channel catalog cache
+- Health, stream and dependency diagnostics
+- FFmpeg/XC credential redaction in bridge logs
 
-## New in v5.3: isolated ICY metadata + full diagnostics
+## Requirements
 
-v5.3 keeps the v5 playback core intact and changes the metadata path so a Ticker/xmplaylist
-refresh can never perform network work in the audio delivery loop. Metadata providers build
-complete ICY blocks in the background and atomically swap immutable cached bytes. The stream
-path only counts audio bytes and inserts a cached block after exactly `ICY_METAINT` audio bytes.
+- Docker with Docker Compose
+- A working Dispatcharr instance
+- Music Assistant if you want automatic radio synchronization
+- FFmpeg is included in the container
 
-This is designed to eliminate metadata-refresh pauses as a possible cause of audible skips or
-repeats. You can also disable in-band ICY injection without disabling metadata collection:
+For the recommended configuration, Dispatcharr should output audio-only **AAC-LC, 128 kbps, 48 kHz, stereo**.
 
-```env
-METADATA_ENABLED=true
-ICY_METADATA_ENABLED=true
-ICY_METAINT=16384
-```
+## Installation
 
-For an A/B test, set `ICY_METADATA_ENABLED=false`. Ticker/xmplaylist metadata continues to be
-available through `/metadata/<channel-id>` and `/channels`, but no ICY blocks are inserted into
-the audio response.
-
-### API and dependency diagnostics
-
-v5.3 adds non-destructive health checks for every external dependency used by the bridge.
-`GET /api/checks` and `POST /api/checks/run` perform a fresh check and return one JSON document.
-The default timeout for each external check is controlled by:
-
-```env
-API_CHECK_TIMEOUT=10
-```
-
-The report includes:
-
-- **Dispatcharr/XC** — XC authentication, `player_api.php`, live categories, live streams,
-  response latency, HTTP status, and filtered catalog count. In Dispatcharr-M3U mode it checks
-  the configured playlist URL, response status, size, latency, and current filtered catalog.
-- **Music Assistant** — API reachability, bearer-token authentication, and read access to the
-  radio library. The diagnostic intentionally does **not** add or delete a radio just to prove
-  write/remove permission; those fields are reported as `not_mutated_by_health_check`.
-- **Ticker/SiriusXM metadata** — `channels.json`, `nowplaying.json`, HTTP status, latency, row
-  counts, current polling state, and number of locally cached metadata matches.
-- **xmplaylist fallback** — `/api/station` and `/api/feed`, HTTP status, latency and returned rows.
-- **FFmpeg** — executable presence, FFprobe presence, FFmpeg version, AAC encoder availability,
-  libmp3lame availability, and configured AAC mode.
-- **Bridge** — version, persistent-cache path/writability, catalog size, metadata source, ICY
-  state, and current shared-hub statistics.
-
-Examples:
+Clone the repository:
 
 ```bash
-curl http://BRIDGE:8088/api/checks
-curl -X POST http://BRIDGE:8088/api/checks/run
+git clone https://github.com/iceman73/iptv-music-assistant-bridge.git
+cd iptv-music-assistant-bridge
 ```
 
-A healthy top-level response looks like:
-
-```json
-{
-  "status": "ok",
-  "failed": [],
-  "checks": {
-    "source": {"status": "ok"},
-    "music_assistant": {"status": "ok"},
-    "ticker": {"status": "ok"},
-    "xmplaylist": {"status": "ok"},
-    "ffmpeg": {"status": "ok"},
-    "bridge": {"status": "ok"}
-  }
-}
-```
-
-If one dependency fails, the overall status becomes `degraded` and its name appears in
-`failed`. Credentials are redacted from returned errors/logs.
-
-### Per-stream diagnostic
-
-Use the stream-specific endpoint to inspect one channel without opening a new source:
+Create your local environment file:
 
 ```bash
-curl http://BRIDGE:8088/api/checks/stream/xc-23261
+cp .env.example .env
 ```
 
-By default this reports catalog identity, current metadata, and an already-active hub if one
-exists. It does not consume one of the limited upstream connections.
-
-To deliberately warm/open the source and verify real audio startup:
-
-```bash
-curl 'http://BRIDGE:8088/api/checks/stream/xc-23261?live=true'
-```
-
-The live check uses the same shared-hub architecture as Music Assistant, reports startup time,
-codec and hub health, and may temporarily use one upstream source slot. Do not run multiple live
-checks concurrently when `UPSTREAM_MAX_CONNECTIONS=2`.
-
-### Troubleshooting with the checks
-
-If audio skips but `/api/checks` is healthy, compare playback with `ICY_METADATA_ENABLED=true`
-and `false`. If disabling ICY eliminates the skips, leave metadata collection enabled and keep
-ICY disabled while inspecting the Music Assistant client's handling of in-band metadata. If the
-problem remains with ICY disabled, inspect `/streams` for `dropped_chunks`,
-`slow_subscriber_disconnects`, queue depth, recent bitrate, HTTP 503 counts and restart counts.
-For one problematic station, run the per-stream check with `?live=true` and compare startup and
-codec results with a known-good station.
-
-## New in v5.2: active-stream-only Ticker polling
-
-Ticker now-playing polling is demand-driven. With the defaults below, the bridge does not poll
-the bulk now-playing feed while no Sirius stream hub is active. The first listener or Music
-Assistant warm-up pin wakes the poller immediately. Fast polling continues while the shared hub
-is running, including the normal 30-second linger after the final listener leaves, then stops.
-
-```env
-TICKER_ACTIVE_POLL_SECONDS=15
-TICKER_IDLE_POLL_SECONDS=0
-```
-
-Set `TICKER_IDLE_POLL_SECONDS` to a non-zero value (for example `900`) only if you want an
-occasional background now-playing refresh while idle. Channel mapping refresh remains cached
-independently and is refreshed when Ticker metadata is next needed.
-
-## Ticker metadata source
-
-The current Dispatcharr Ticker plugin uses these free bulk feeds:
-
-- `https://stellartunerlog.com/nowplaying.json`
-- `https://stellartunerlog.com/channels.json`
-
-Ticker itself caches now-playing for 15 seconds. v5.2 uses the same approach directly,
-so **you do not need to enable Ticker's video overlay or let Ticker change stream
-profiles** just to get metadata.
-
-Recommended settings:
-
-```env
-METADATA_PROVIDER=ticker
-METADATA_FALLBACK=xmplaylist
-TICKER_ACTIVE_POLL_SECONDS=15
-TICKER_IDLE_POLL_SECONDS=0
-TICKER_CHANNEL_REFRESH_SECONDS=86400
-```
-
-If the Ticker bulk feed is unavailable, the bridge can fall back to xmplaylist.
-
-## Build and run
+Edit `.env` with your Dispatcharr/XC and Music Assistant settings, then build and start the container:
 
 ```bash
 docker compose up -d --build
 ```
 
-Check:
+Check that the bridge is running:
 
-```text
-http://YOUR-BRIDGE:8088/health
-http://YOUR-BRIDGE:8088/channels
-http://YOUR-BRIDGE:8088/streams
+```bash
+curl http://YOUR-BRIDGE-HOST:8088/health
 ```
 
-`/health` should show metadata similar to:
+The default bridge port is **8088**.
 
-```json
-{
-  "provider": "ticker",
-  "active_source": "ticker",
-  "fallback_provider": "xmplaylist",
-  "ticker_poll_seconds": 15
-}
+To update later:
+
+```bash
+git pull
+docker compose down
+docker compose up -d --build
 ```
 
-## Recommended Dispatcharr audio profile
+## Dispatcharr configuration
 
-The AAC-copy path assumes Dispatcharr outputs AAC-LC, 48 kHz, stereo:
+### Recommended audio-only stream profile
+
+Create a Dispatcharr stream profile named **audio_only** and use:
 
 ```text
 -user_agent {userAgent} -i {streamUrl} -vn -map 0:a:0 -c:a aac -b:a 128k -ar 48000 -ac 2 -probesize 500000 -analyzeduration 1000000 -fflags +discardcorrupt+nobuffer -flags low_delay -af aresample=async=1 -muxdelay 0 -muxpreload 0 -f mpegts pipe:1
 ```
 
-Then use:
+This profile:
+
+- removes video
+- selects the first audio stream
+- outputs AAC at 128 kbps
+- normalizes to 48 kHz stereo
+- uses MPEG-TS for the Dispatcharr output
+- keeps the stream suitable for the bridge's `AAC_MODE=copy` path
+
+If your provider is already stable AAC, this avoids an additional audio encode inside the bridge.
+
+## Source configuration
+
+The bridge supports two source modes.
+
+### Option 1: Xtream Codes / XC
+
+This is the recommended setup when using Dispatcharr's XC-compatible endpoint.
 
 ```env
+SOURCE_MODE=xc
+
+XC_BASE_URL=http://dispatcharr:9191
+XC_USERNAME=your-xc-username
+XC_PASSWORD=your-xc-password
+XC_OUTPUT=ts
+XC_VERIFY_SSL=true
+
+GROUP_FILTER=SiriusXM
+NAME_FILTER=
+XC_CATEGORY_IDS=
+```
+
+The bridge authenticates to `player_api.php`, loads live categories and streams, then creates the appropriate XC live-stream URL.
+
+### Option 2: Dispatcharr M3U
+
+```env
+SOURCE_MODE=dispatcharr
+
+DISPATCHARR_BASE_URL=http://dispatcharr:9191
+DISPATCHARR_M3U_PATH=/output/m3u
+DISPATCHARR_M3U_URL=
+
+GROUP_FILTER=SiriusXM
+NAME_FILTER=
+```
+
+Set `DISPATCHARR_M3U_URL` if you want to use a complete custom M3U URL. Otherwise the bridge uses:
+
+```text
+DISPATCHARR_BASE_URL + DISPATCHARR_M3U_PATH
+```
+
+## Minimum recommended configuration
+
+For an XC-based Dispatcharr installation with Music Assistant:
+
+```env
+# Source
+SOURCE_MODE=xc
+XC_BASE_URL=http://dispatcharr:9191
+XC_USERNAME=your-xc-username
+XC_PASSWORD=your-xc-password
+XC_OUTPUT=ts
+XC_VERIFY_SSL=true
+GROUP_FILTER=SiriusXM
+
+# Bridge
+PUBLIC_BASE_URL=http://YOUR-BRIDGE-HOST:8088
+DEFAULT_FORMAT=aac
+IMPORT_FORMAT=aac
+
+# Audio
 AAC_MODE=copy
 AAC_BITRATE=128k
 SAMPLE_RATE=48000
 CHANNELS=2
+
+# Shared stream behavior
+UPSTREAM_MAX_CONNECTIONS=2
+STREAM_LINGER_SECONDS=30
+STREAM_SUBSCRIBER_QUEUE_CHUNKS=16
+STREAM_READ_CHUNK_BYTES=16384
+STREAM_RING_BUFFER_SECONDS=2
+
+# Metadata
+METADATA_ENABLED=true
+METADATA_PROVIDER=ticker
+METADATA_FALLBACK=xmplaylist
+TICKER_ACTIVE_POLL_SECONDS=15
+TICKER_IDLE_POLL_SECONDS=0
+ICY_METADATA_ENABLED=true
+ICY_METAINT=16384
+
+# Music Assistant
+MUSIC_ASSISTANT_URL=http://music-assistant:8095
+MUSIC_ASSISTANT_TOKEN=YOUR_LONG_LIVED_TOKEN
+MA_AUTO_SYNC=true
+MA_SYNC_ON_START=true
+MA_SYNC_AFTER_CATALOG_REFRESH=true
+MA_REMOVE_MISSING=false
 ```
 
-## v5 reconnect behavior
+## Configuration reference
 
-The input FFmpeg command uses reconnect support for streamed HTTP sources, EOF,
-network errors, and transient HTTP errors, with a short maximum reconnect delay.
-The bridge does not kill an FFmpeg process merely because no bytes arrived for a
-short diagnostic stall interval.
+### Bridge and audio
 
-If FFmpeg actually exits while listeners or an import pin remain, the hub respawns it.
-If there is no demand, it does not restart an idle hub.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PUBLIC_BASE_URL` | `http://localhost:8088` | URL Music Assistant uses to reach the bridge |
+| `DEFAULT_FORMAT` | `aac` | Default playlist format: `aac` or `mp3` |
+| `IMPORT_FORMAT` | same as default | Format imported into Music Assistant |
+| `AAC_MODE` | `auto` | `copy`, `auto`, or transcode behavior |
+| `AAC_BITRATE` | `128k` | AAC bitrate when transcoding |
+| `MP3_BITRATE` | `192k` | MP3 output bitrate |
+| `SAMPLE_RATE` | `48000` | Output sample rate |
+| `CHANNELS` | `2` | Output audio channels |
+| `SOURCE_RW_TIMEOUT_SECONDS` | `60` | Upstream read timeout |
+| `UPSTREAM_MAX_CONNECTIONS` | `2` | Maximum simultaneous upstream streams |
+| `STREAM_LINGER_SECONDS` | `30` | Keep a hub hot after the final listener leaves |
+| `STREAM_SUBSCRIBER_QUEUE_CHUNKS` | `16` | Per-listener queue depth |
+| `STREAM_READ_CHUNK_BYTES` | `16384` | FFmpeg output read size |
+| `STREAM_RING_BUFFER_SECONDS` | `2` | Encoded reconnect pre-roll |
+| `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
+| `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
+| `FFMPEG_LOG_LEVEL` | `warning` | FFmpeg log verbosity |
 
-## Persistent cache
+### Catalog and filtering
 
-The catalog is stored in:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GROUP_FILTER` | empty | Only include groups containing this text |
+| `NAME_FILTER` | empty | Only include channel names containing this text |
+| `XC_CATEGORY_IDS` | empty | Optional comma-separated XC category IDs |
+| `CATALOG_REFRESH_SECONDS` | `86400` | Normal catalog refresh interval |
+| `CATALOG_RETRY_SECONDS` | `3600` | Retry interval after a failed refresh |
+| `BRIDGE_CACHE_FILE` | `/data/bridge-cache.json` | Persistent last-known-good catalog |
+
+### SiriusXM metadata
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `METADATA_ENABLED` | `true` | Enable now-playing collection |
+| `METADATA_PROVIDER` | `auto` | Metadata provider; recommended value is `ticker` |
+| `METADATA_FALLBACK` | `xmplaylist` | Fallback provider |
+| `TICKER_NOWPLAYING_URL` | StellarTunerLog bulk feed | Current SiriusXM now-playing feed |
+| `TICKER_CHANNEL_URL` | StellarTunerLog channel feed | SiriusXM channel mapping |
+| `TICKER_ACTIVE_POLL_SECONDS` | `15` | Poll interval while a bridge stream is active |
+| `TICKER_IDLE_POLL_SECONDS` | `0` | Idle polling; `0` disables it |
+| `TICKER_CHANNEL_REFRESH_SECONDS` | `86400` | Channel-map refresh interval |
+| `XMPLAYLIST_POLL_SECONDS` | `120` | xmplaylist fallback polling interval |
+| `ICY_METADATA_ENABLED` | `true` | Inject artist/title into clients requesting ICY metadata |
+| `ICY_METAINT` | `16384` | Audio bytes between ICY metadata blocks |
+
+Ticker/xmplaylist lookups run outside the audio-delivery loop. v5.3 prebuilds the ICY metadata block and only inserts cached bytes into the stream.
+
+For troubleshooting, you can disable in-band metadata without disabling metadata collection:
+
+```env
+ICY_METADATA_ENABLED=false
+```
+
+### Music Assistant
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MUSIC_ASSISTANT_URL` | `http://music-assistant:8095` | Music Assistant API URL |
+| `MUSIC_ASSISTANT_TOKEN` | empty | Long-lived MA bearer token |
+| `IMPORT_LOGOS` | `true` | Import channel artwork |
+| `MA_AUTO_SYNC` | `false` | Enable automatic MA radio synchronization |
+| `MA_SYNC_ON_START` | `true` | Sync after bridge startup |
+| `MA_SYNC_AFTER_CATALOG_REFRESH` | `true` | Sync after catalog refresh |
+| `MA_REMOVE_MISSING` | `false` | Remove bridge-managed stations no longer in the source |
+| `MA_SYNC_TIMEOUT` | `90` | MA API timeout |
+| `MA_ADD_RETRIES` | `3` | Add-radio retry count |
+| `MA_SYNC_CONCURRENCY` | `1` | Number of stations imported concurrently |
+| `STREAM_WARMUP_ENABLED` | `true` | Warm new streams before MA validates them |
+| `MA_IMPORT_RELEASE_GRACE_SECONDS` | `11` | Keep a stream pinned briefly after MA accepts it |
+
+## How streaming works
+
+```text
+Dispatcharr / XC
+      ↓
+one FFmpeg process per active channel + format
+      ↓
+shared encoded stream hub
+      ├── Music Assistant
+      ├── another listener
+      └── reconnecting listener
+```
+
+FFmpeg owns normal upstream HTTP reconnects. The bridge does not intentionally kill and respawn FFmpeg because of a short gap in received audio. When the last listener disconnects, the hub remains available for `STREAM_LINGER_SECONDS` before the upstream is closed.
+
+## Music Assistant setup
+
+With automatic synchronization enabled, the bridge can add/update the filtered stations itself.
+
+Force a manual sync:
+
+```bash
+curl -X POST http://YOUR-BRIDGE-HOST:8088/ma/sync
+```
+
+Check sync status:
+
+```bash
+curl http://YOUR-BRIDGE-HOST:8088/ma/status
+```
+
+Alternatively, Music Assistant can consume the generated playlist:
+
+```text
+http://YOUR-BRIDGE-HOST:8088/playlist.m3u8
+```
+
+## API endpoints
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| GET | `/` | Bridge summary and endpoint discovery |
+| GET | `/health` | Bridge, catalog, metadata, MA and playback health |
+| GET | `/channels` | Filtered channel catalog with bridge URLs and now-playing data |
+| GET | `/streams` | Active shared hubs, listeners and stream diagnostics |
+| GET | `/playlist.m3u8` | Generated radio playlist |
+| GET | `/playlist.m3u` | Generated radio playlist |
+| GET | `/stream/{channel_id}.aac` | AAC radio stream |
+| GET | `/stream/{channel_id}.mp3` | MP3 radio stream |
+| GET | `/metadata/{channel_id}` | Metadata mapping and current now-playing data |
+| GET | `/probe/{channel_id}` | Probe source audio codec and selected AAC mode |
+| POST | `/catalog/refresh` | Force a catalog refresh |
+| GET | `/ma/status` | Music Assistant synchronization status |
+| POST | `/ma/sync` | Force Music Assistant synchronization |
+| GET | `/api/checks` | Run dependency/API diagnostics |
+| POST | `/api/checks/run` | Force dependency/API diagnostics |
+| GET | `/api/checks/stream/{channel_id}` | Non-disruptive per-channel diagnostic |
+| GET | `/api/checks/stream/{channel_id}?live=true` | Open/warm one source and verify real audio |
+
+### Full dependency check
+
+```bash
+curl http://YOUR-BRIDGE-HOST:8088/api/checks
+```
+
+It checks:
+
+- Dispatcharr/XC connectivity and authentication
+- Music Assistant connectivity/authentication
+- Ticker/SiriusXM metadata feeds
+- xmplaylist fallback
+- FFmpeg and FFprobe
+- bridge cache and internal stream state
+
+A failed dependency changes the overall result to `degraded`.
+
+### Per-stream check
+
+Without opening a new source:
+
+```bash
+curl http://YOUR-BRIDGE-HOST:8088/api/checks/stream/xc-23261
+```
+
+To deliberately open/warm the source:
+
+```bash
+curl 'http://YOUR-BRIDGE-HOST:8088/api/checks/stream/xc-23261?live=true'
+```
+
+The live check can consume one of the configured upstream connection slots, so avoid running several live checks at the same time when `UPSTREAM_MAX_CONNECTIONS=2`.
+
+## Troubleshooting
+
+### Stream skips or repeats
+
+First compare direct Dispatcharr playback with bridge playback.
+
+Then temporarily disable ICY injection:
+
+```env
+ICY_METADATA_ENABLED=false
+```
+
+Metadata will still be collected and visible through the API. If playback becomes clean, the issue is isolated to the client's handling of in-band ICY metadata.
+
+If the problem remains, inspect:
+
+```text
+/streams
+/api/checks
+/api/checks/stream/{channel_id}?live=true
+```
+
+Look for upstream restarts, HTTP errors, queue buildup, dropped chunks, slow-subscriber disconnects and abnormal bitrate.
+
+### Music Assistant will not add a station
+
+Check:
+
+```text
+/ma/status
+/api/checks
+/probe/{channel_id}
+```
+
+Make sure `PUBLIC_BASE_URL` is reachable from Music Assistant and the MA token has the necessary permissions.
+
+### Metadata is old or missing
+
+Check:
+
+```text
+/metadata/{channel_id}
+/health
+/api/checks
+```
+
+The recommended Ticker metadata source polls every 15 seconds only while a shared stream hub is active. `TICKER_IDLE_POLL_SECONDS=0` disables unnecessary idle polling.
+
+## Security
+
+Keep the bridge on a trusted LAN or behind your reverse proxy/firewall. The streaming and diagnostics endpoints are not intended to be exposed directly to the public Internet.
+
+Do not commit your real `.env` file. XC passwords, Music Assistant tokens and other secrets belong only in your local environment.
+
+The bridge redacts configured credentials from its own error and FFmpeg logs where possible.
+
+## Persistent data
+
+The Docker Compose configuration stores the last-known-good channel catalog in the `bridge-data` volume:
 
 ```text
 /data/bridge-cache.json
 ```
 
-The included compose file persists `/data` in the `bridge-data` volume. If a catalog
-refresh fails, the last known-good catalog can continue to be served.
+This allows the bridge to continue using its cached catalog if a scheduled source refresh temporarily fails.
 
-## Music Assistant synchronization
+## License
 
-For automatic Radio synchronization:
-
-```env
-MUSIC_ASSISTANT_URL=http://music-assistant:8095
-MUSIC_ASSISTANT_TOKEN=YOUR_TOKEN
-MA_AUTO_SYNC=true
-MA_SYNC_ON_START=true
-MA_SYNC_AFTER_CATALOG_REFRESH=true
-MA_REMOVE_MISSING=false
-MA_IMPORT_RELEASE_GRACE_SECONDS=11
-```
-
-The bridge warms/pins the same shared stream while Music Assistant validates a new
-Radio URL, then keeps it pinned for the release-grace period before allowing normal
-30-second linger behavior.
-
-Manual sync:
-
-```bash
-curl -X POST http://YOUR-BRIDGE:8088/ma/sync
-```
-
-## Useful endpoints
-
-- `/health` — service/catalog/metadata/MA state
-- `/channels` — filtered channel catalog and now-playing data
-- `/streams` — active shared hub diagnostics
-- `/metadata/<channel-id>` — metadata debug view
-- `/playlist.m3u8` — Music Assistant-ready playlist
-- `/stream/<channel-id>.aac` — AAC radio stream
-- `/stream/<channel-id>.mp3` — MP3 radio stream
-
-## Security
-
-Keep port 8088 private to your LAN/reverse proxy. XC credentials and configured
-secrets are redacted from bridge error/FFmpeg logs.
+Use and modify this project for your own environment. Review the terms of your IPTV, SiriusXM and metadata providers and comply with all applicable service agreements.
