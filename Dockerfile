@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=python:3.12-slim
+ARG BASE_IMAGE=mirror.gcr.io/library/python:3.12-slim
 FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
