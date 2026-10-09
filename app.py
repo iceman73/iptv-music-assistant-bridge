@@ -32,14 +32,14 @@ DISPATCHARR_M3U_URL = os.getenv("DISPATCHARR_M3U_URL", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8088").rstrip("/")
 GROUP_FILTER = os.getenv("GROUP_FILTER", "").strip()
 NAME_FILTER = os.getenv("NAME_FILTER", "").strip()
-DEFAULT_FORMAT = os.getenv("DEFAULT_FORMAT", "aac").lower()
+DEFAULT_FORMAT = os.getenv("DEFAULT_FORMAT", "mp3").lower()
 MP3_BITRATE = os.getenv("MP3_BITRATE", "192k")
 AAC_BITRATE = os.getenv("AAC_BITRATE", "128k")
 SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.4")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.5")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -1612,7 +1612,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.4"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.5"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -1691,7 +1691,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.4.0", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.5.0", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2208,7 +2208,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.4.0",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.5.0",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
