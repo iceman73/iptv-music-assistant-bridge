@@ -422,7 +422,7 @@ This allows the bridge to continue using its cached catalog if a scheduled sourc
 
 Licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for the full license text and [NOTICE](NOTICE) for project and third-party attribution information.
 
-Copyright 2026 Chris Stocker.
+Copyright 2026 iceman73.
 
 This project is an independent integration tool and is not affiliated with or endorsed by Dispatcharr, Music Assistant, SiriusXM, Amazon, StellarTunerLog, xmplaylist, or their respective owners.
 
