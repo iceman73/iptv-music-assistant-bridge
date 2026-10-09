@@ -420,4 +420,10 @@ This allows the bridge to continue using its cached catalog if a scheduled sourc
 
 ## License
 
-Use and modify this project for your own environment. Review the terms of your IPTV, SiriusXM and metadata providers and comply with all applicable service agreements.
+Licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for the full license text and [NOTICE](NOTICE) for project and third-party attribution information.
+
+Copyright 2026 Chris Stocker.
+
+This project is an independent integration tool and is not affiliated with or endorsed by Dispatcharr, Music Assistant, SiriusXM, Amazon, StellarTunerLog, xmplaylist, or their respective owners.
+
+The Apache-2.0 license applies to this project's source code and documentation only. It does not grant rights to third-party audio streams, logos, artwork, metadata, trademarks, subscription services, or other content. Users are responsible for complying with the terms and licensing requirements of the services they connect.
