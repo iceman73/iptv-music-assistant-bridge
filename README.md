@@ -4,13 +4,14 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.3**
+Current release: **v5.4**
 
 ## Features
 
 - Dispatcharr M3U or Xtream Codes / XC source support
 - AAC and MP3 radio endpoints for Music Assistant
 - Shared upstream stream per channel and format
+- Coalesced 8 KB client writes to smooth tiny FFmpeg pipe reads
 - Configurable upstream connection limit
 - 30-second hot-stream linger to avoid unnecessary reconnects
 - Startup silence while a cold IPTV stream opens
@@ -164,6 +165,8 @@ UPSTREAM_MAX_CONNECTIONS=2
 STREAM_LINGER_SECONDS=30
 STREAM_SUBSCRIBER_QUEUE_CHUNKS=16
 STREAM_READ_CHUNK_BYTES=16384
+STREAM_COALESCE_BYTES=8192
+STREAM_COALESCE_MAX_SECONDS=0.50
 STREAM_RING_BUFFER_SECONDS=2
 
 # Metadata
@@ -202,7 +205,9 @@ MA_REMOVE_MISSING=false
 | `UPSTREAM_MAX_CONNECTIONS` | `2` | Maximum simultaneous upstream streams |
 | `STREAM_LINGER_SECONDS` | `30` | Keep a hub hot after the final listener leaves |
 | `STREAM_SUBSCRIBER_QUEUE_CHUNKS` | `16` | Per-listener queue depth |
-| `STREAM_READ_CHUNK_BYTES` | `16384` | FFmpeg output read size |
+| `STREAM_READ_CHUNK_BYTES` | `16384` | Maximum FFmpeg pipe read request; actual reads may be much smaller |
+| `STREAM_COALESCE_BYTES` | `8192` | Coalesce small encoded reads into steadier client writes; `0` disables |
+| `STREAM_COALESCE_MAX_SECONDS` | `0.50` | Maximum time to hold a partial coalesced write |
 | `STREAM_RING_BUFFER_SECONDS` | `2` | Encoded reconnect pre-roll |
 | `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
 | `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
@@ -259,6 +264,14 @@ ICY_METADATA_ENABLED=false
 | `MA_SYNC_CONCURRENCY` | `1` | Number of stations imported concurrently |
 | `STREAM_WARMUP_ENABLED` | `true` | Warm new streams before MA validates them |
 | `MA_IMPORT_RELEASE_GRACE_SECONDS` | `11` | Keep a stream pinned briefly after MA accepts it |
+
+### v5.4 stream write smoothing
+
+FFmpeg can return very small encoded reads even when the bridge asks the pipe for 16 KB. In v5.4 the bridge keeps codec data unchanged but coalesces adjacent encoded reads before broadcasting them to Music Assistant and hardware players. The default target is 8 KB with a 0.5-second maximum hold time. Startup silence and real audio are never combined in the same coalesced write.
+
+This is intended to reduce bursty HTTP delivery to clients such as smart speakers without adding another codec conversion. Check `/streams`: `avg_chunk_bytes` should now be substantially larger than the few-hundred-byte values seen before v5.4, and each hub reports `coalesce_bytes` and `coalesce_max_seconds`.
+
+Set `STREAM_COALESCE_BYTES=0` to disable this behavior for comparison.
 
 ## How streaming works
 
