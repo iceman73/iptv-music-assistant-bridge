@@ -1,0 +1,47 @@
+name: Expand v5.3 source baseline
+
+on:
+  push:
+    paths:
+      - 'bootstrap-v5.3.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  expand:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Expand source archive
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/v53
+          mkdir -p /tmp/v53
+          unzip -q bootstrap-v5.3.zip -d /tmp/v53
+          src="/tmp/v53/dispatcharr-music-assistant-bridge-v5.3"
+          test -f "$src/app.py"
+          cp "$src/app.py" app.py
+          cp "$src/import_to_ma.py" import_to_ma.py
+          cp "$src/test_app.py" test_app.py
+          cp "$src/README.md" README.md
+          cp "$src/.env.example" .env.example
+          cp "$src/Dockerfile" Dockerfile
+          cp "$src/docker-compose.yml" docker-compose.yml
+          cp "$src/requirements.txt" requirements.txt
+          cp "$src/test_stream.sh" test_stream.sh
+          chmod +x test_stream.sh
+          rm -f bootstrap-v5.3.zip
+      - name: Commit expanded source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Expand v5.3 source baseline"
+          git push
