@@ -529,6 +529,33 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.3.0"
+    assert row["version"] == "5.4.0"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
+
+def test_coalesces_tiny_ffmpeg_reads_without_changing_bytes():
+    async def run():
+        async def src():
+            yield b"abc", True
+            yield b"def", True
+            yield b"ghij", True
+
+        out = [item async for item in app.coalesce_audio_chunks(src(), target_bytes=8, max_delay_seconds=60)]
+        assert out == [(b"abcdefgh", True), (b"ij", True)]
+        assert b"".join(chunk for chunk, _ in out) == b"abcdefghij"
+
+    asyncio.run(run())
+
+
+def test_coalescer_flushes_on_silence_to_real_audio_transition():
+    async def run():
+        async def src():
+            yield b"sil", False
+            yield b"ence", False
+            yield b"real", True
+            yield b"audio", True
+
+        out = [item async for item in app.coalesce_audio_chunks(src(), target_bytes=8192, max_delay_seconds=60)]
+        assert out == [(b"silence", False), (b"realaudio", True)]
+
+    asyncio.run(run())
