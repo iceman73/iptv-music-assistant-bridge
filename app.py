@@ -997,4 +997,1407 @@ class MusicAssistantSyncService:
         async with httpx.AsyncClient(timeout=MA_SYNC_TIMEOUT, follow_redirects=True) as client:
             response = await client.post(f"{MUSIC_ASSISTANT_URL}/api", json=payload, headers=headers)
         if response.status_code >= 400:
-            detail = response.text.strip()
+            detail = response.text.strip()            if len(detail) > 300:
+                detail = detail[:300] + "..."
+            raise RuntimeError(f"MA {command} failed HTTP {response.status_code}: {detail}")
+        if not response.content:
+            return None
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    @staticmethod
+    def _managed_url_from_item(item: dict[str, Any]) -> str:
+        mappings = item.get("provider_mappings") or []
+        if isinstance(mappings, dict):
+            mappings = list(mappings.values())
+        if not isinstance(mappings, list):
+            return ""
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            domain = str(mapping.get("provider_domain") or mapping.get("provider") or "")
+            instance = str(mapping.get("provider_instance") or "")
+            item_id = str(mapping.get("item_id") or "")
+            if domain == "builtin" or instance == "builtin":
+                if item_id.startswith(MA_MANAGED_URL_PREFIX):
+                    return item_id
+        return ""
+
+    async def _managed_library_radios(self) -> list[dict[str, Any]]:
+        managed: list[dict[str, Any]] = []
+        offset = 0
+        limit = 500
+        while True:
+            rows = await self._call(
+                "music/radios/library_items",
+                {"limit": limit, "offset": offset, "summary": False},
+            )
+            if not isinstance(rows, list):
+                raise RuntimeError("MA music/radios/library_items returned an unexpected response")
+            for row in rows:
+                if isinstance(row, dict) and self._managed_url_from_item(row):
+                    managed.append(row)
+            if len(rows) < limit:
+                break
+            offset += limit
+        return managed
+
+    async def _add_radio_with_warm_source(self, channel: Channel, args: dict[str, Any]) -> None:
+        """Warm the source, keep it open through every MA add retry, then close it."""
+        async with stream_manager.hold_warm(channel, IMPORT_FORMAT):
+            last_exc: Exception | None = None
+            for attempt in range(1, MA_ADD_RETRIES + 1):
+                try:
+                    await self._call("builtin/add_radio", args)
+                    if MA_IMPORT_RELEASE_GRACE_SECONDS:
+                        await asyncio.sleep(MA_IMPORT_RELEASE_GRACE_SECONDS)
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    LOGGER.warning(
+                        "MA add_radio failed for %s (attempt %d/%d) while warm source remains open: %s",
+                        channel.name, attempt, MA_ADD_RETRIES, exc,
+                    )
+                    if attempt < MA_ADD_RETRIES and MA_ADD_RETRY_DELAY:
+                        await asyncio.sleep(MA_ADD_RETRY_DELAY)
+            assert last_exc is not None
+            raise last_exc
+
+    async def sync(self, channels: list[Channel], reason: str = "manual") -> dict[str, Any]:
+        if IMPORT_FORMAT not in {"aac", "mp3"}:
+            raise RuntimeError("IMPORT_FORMAT must be aac or mp3")
+        if not channels:
+            raise RuntimeError("Refusing to sync an empty source catalog")
+        async with self.lock:
+            desired = {ch.bridge_url(IMPORT_FORMAT): ch for ch in channels}
+            self.last_desired_count = len(desired)
+            self.last_reason = reason
+
+            # Always read bridge-managed MA radios so unchanged stations can be
+            # skipped. This avoids warming/re-probing the entire catalog every day.
+            existing_managed = await self._managed_library_radios()
+            existing_by_url = {
+                self._managed_url_from_item(item): item
+                for item in existing_managed
+                if self._managed_url_from_item(item)
+            }
+
+            synced = 0
+            unchanged = 0
+            add_failures = 0
+            failed_radios: list[dict[str, str]] = []
+            # Intentionally sequential by default. Dispatcharr may need to fill its
+            # cache for a cold channel; parallel warm-ups can stampede upstream.
+            if MA_SYNC_CONCURRENCY != 1:
+                LOGGER.warning("MA_SYNC_CONCURRENCY=%d requested; v5 serializes warm/import operations for source safety", MA_SYNC_CONCURRENCY)
+            for url, channel in desired.items():
+                existing = existing_by_url.get(url)
+                if existing and _existing_radio_name(existing) == channel.name:
+                    unchanged += 1
+                    continue
+                args: dict[str, Any] = {"url": url, "name": channel.name}
+                if IMPORT_LOGOS and channel.logo:
+                    args["image_url"] = channel.logo
+                try:
+                    await self._add_radio_with_warm_source(channel, args)
+                    synced += 1
+                except Exception as exc:
+                    add_failures += 1
+                    if len(failed_radios) < 25:
+                        failed_radios.append({"name": channel.name, "url": url, "error": str(exc)[:300]})
+                    LOGGER.warning("Could not add/update MA radio %s: %s", channel.name, exc)
+
+            removed = 0
+            remove_failures = 0
+            if MA_REMOVE_MISSING:
+                desired_urls = set(desired)
+                for item in existing_managed:
+                    managed_url = self._managed_url_from_item(item)
+                    if not managed_url or managed_url in desired_urls:
+                        continue
+                    library_id = item.get("item_id")
+                    if library_id in (None, ""):
+                        continue
+                    try:
+                        # Current MA radio controller exposes music/radios/remove.
+                        # This requires Library Manage scope on the token.
+                        await self._call(
+                            "music/radios/remove",
+                            {"item_id": library_id, "recursive": True},
+                        )
+                        removed += 1
+                    except Exception as exc:
+                        remove_failures += 1
+                        LOGGER.warning("Could not remove stale MA radio %s: %s", managed_url, exc)
+
+            self.last_synced_count = synced
+            self.last_unchanged_count = unchanged
+            self.last_add_failures = add_failures
+            self.last_failed_radios = failed_radios
+            self.last_removed_count = removed
+            self.last_remove_failures = remove_failures
+            self.last_sync_at = utc_now_iso()
+            errors = []
+            if add_failures:
+                errors.append(f"{add_failures} radio add/update(s) failed")
+            if remove_failures:
+                errors.append(f"{remove_failures} stale radio removal(s) failed")
+            self.last_error = "; ".join(errors)
+            LOGGER.info(
+                "Music Assistant sync complete: %d add/update, %d unchanged, %d add failure(s), %d removed, %d removal failure(s)",
+                synced,
+                unchanged,
+                add_failures,
+                removed,
+                remove_failures,
+            )
+            return self.status()
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "configured": bool(MUSIC_ASSISTANT_URL and MUSIC_ASSISTANT_TOKEN),
+            "url": MUSIC_ASSISTANT_URL,
+            "format": IMPORT_FORMAT,
+            "remove_missing": MA_REMOVE_MISSING,
+            "managed_url_prefix": MA_MANAGED_URL_PREFIX,
+            "warmup_enabled": STREAM_WARMUP_ENABLED,
+            "warmup_timeout": STREAM_WARMUP_TIMEOUT,
+            "warmup_retries": STREAM_WARMUP_RETRIES,
+            "add_retries": MA_ADD_RETRIES,
+            "last_sync": self.last_sync_at,
+            "last_reason": self.last_reason,
+            "last_error": self.last_error,
+            "desired_count": self.last_desired_count,
+            "synced_count": self.last_synced_count,
+            "unchanged_count": self.last_unchanged_count,
+            "add_failures": self.last_add_failures,
+            "failed_radios": self.last_failed_radios,
+            "removed_count": self.last_removed_count,
+            "remove_failures": self.last_remove_failures,
+            "sync_in_progress": bool(self.task and not self.task.done()),
+        }
+
+
+class MetadataService:
+    def __init__(self) -> None:
+        self.items_by_number: dict[str, NowPlaying] = {}
+        self.items_by_name: dict[str, NowPlaying] = {}
+        self.provider = self._select_provider()
+        self.last_update = ""
+        self.last_error = ""
+        self.task: asyncio.Task | None = None
+        self._xm_stations_by_id: dict[str, dict[str, str]] = {}
+        self._xm_station_refresh = 0.0
+        self.fallback_provider = METADATA_FALLBACK if METADATA_FALLBACK in {"xmplaylist", "stellar", "none", "disabled"} else "xmplaylist"
+        self._ticker_channels: list[dict[str, Any]] = []
+        self._ticker_channels_refreshed = 0.0
+        self.active_source = self.provider
+        self._activity_event = asyncio.Event()
+        self._ticker_polling_active = False
+        self._icy_by_number: dict[str, bytes] = {}
+        self._icy_by_name: dict[str, bytes] = {}
+
+    def _select_provider(self) -> str:
+        if not METADATA_ENABLED:
+            return "disabled"
+        if METADATA_PROVIDER in {"ticker", "xmplaylist", "stellar"}:
+            if METADATA_PROVIDER == "stellar" and not STELLAR_API_KEY:
+                LOGGER.warning("METADATA_PROVIDER=stellar but STELLAR_API_KEY is empty; falling back to xmplaylist")
+                return "xmplaylist"
+            return METADATA_PROVIDER
+        # auto keeps historical behavior; choose ticker explicitly to use its free
+        # 15-second bulk now-playing feed.
+        return "stellar" if STELLAR_API_KEY else "xmplaylist"
+
+    async def start(self) -> None:
+        if self.provider == "disabled":
+            return
+        self.task = asyncio.create_task(self._run(), name="metadata-poller")
+
+    async def stop(self) -> None:
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+    def notify_stream_activity(self) -> None:
+        """Wake the Ticker poller when a Sirius stream becomes active."""
+        if self.provider == "ticker":
+            self._activity_event.set()
+
+    def _ticker_has_active_streams(self) -> bool:
+        # A hub remains running during STREAM_LINGER_SECONDS, so this naturally
+        # keeps fast metadata polling alive through the linger window.
+        return stream_manager.has_active_hubs()
+
+    async def _wait_for_ticker_activity(self) -> None:
+        self._ticker_polling_active = False
+        self.active_source = "ticker-idle"
+        if TICKER_IDLE_POLL_SECONDS > 0:
+            try:
+                await asyncio.wait_for(self._activity_event.wait(), timeout=TICKER_IDLE_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                return
+        else:
+            await self._activity_event.wait()
+        self._activity_event.clear()
+
+    async def _run(self) -> None:
+        while True:
+            try:
+                if self.provider == "ticker":
+                    active = self._ticker_has_active_streams()
+                    if not active:
+                        await self._wait_for_ticker_activity()
+                        active = self._ticker_has_active_streams()
+                        if not active and TICKER_IDLE_POLL_SECONDS <= 0:
+                            continue
+
+                    self._ticker_polling_active = active
+                    try:
+                        await self._refresh_ticker()
+                        self.active_source = "ticker" if active else "ticker-idle-refresh"
+                        sleep_for = TICKER_ACTIVE_POLL_SECONDS if active else TICKER_IDLE_POLL_SECONDS
+                    except Exception as ticker_exc:
+                        self.last_error = str(ticker_exc)
+                        LOGGER.warning("Ticker metadata refresh failed: %s", ticker_exc)
+                        if self.fallback_provider == "stellar" and STELLAR_API_KEY:
+                            await self._refresh_stellar()
+                            self.active_source = "stellar-fallback"
+                        elif self.fallback_provider == "xmplaylist":
+                            await self._refresh_xmplaylist()
+                            self.active_source = "xmplaylist-fallback"
+                        sleep_for = min(TICKER_ACTIVE_POLL_SECONDS if active else max(TICKER_IDLE_POLL_SECONDS, 30.0), 60.0)
+                elif self.provider == "stellar":
+                    await self._refresh_stellar()
+                    self.active_source = "stellar"
+                    sleep_for = STELLAR_POLL_SECONDS
+                else:
+                    await self._refresh_xmplaylist()
+                    self.active_source = "xmplaylist"
+                    sleep_for = XMPLAYLIST_POLL_SECONDS
+                self.last_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # keep audio alive even if metadata provider is down
+                self.last_error = str(exc)
+                LOGGER.warning("Metadata refresh failed (%s): %s", self.provider, exc)
+                sleep_for = 30
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+    def _replace_cache(self, items: list[NowPlaying]) -> None:
+        by_number: dict[str, NowPlaying] = {}
+        by_name: dict[str, NowPlaying] = {}
+        for item in items:
+            if item.channel_number:
+                by_number[clean_channel_number(item.channel_number)] = item
+            norm = normalize_name(item.channel_name)
+            if norm:
+                by_name[norm] = item
+        # Build ICY blocks before the atomic cache swap. Stream delivery never
+        # performs provider I/O or JSON parsing; it only reads immutable bytes.
+        icy_by_number: dict[str, bytes] = {}
+        icy_by_name: dict[str, bytes] = {}
+        for item in items:
+            block = _icy_block_for_now_playing(item)
+            if item.channel_number:
+                icy_by_number[clean_channel_number(item.channel_number)] = block
+            norm = normalize_name(item.channel_name)
+            if norm:
+                icy_by_name[norm] = block
+        self.items_by_number = by_number
+        self.items_by_name = by_name
+        self._icy_by_number = icy_by_number
+        self._icy_by_name = icy_by_name
+        self.last_update = utc_now_iso()
+        LOGGER.info("Metadata cache updated from %s with %d channel(s)", self.provider, len(items))
+
+    async def _refresh_xm_station_catalog(self, client: httpx.AsyncClient) -> None:
+        if self._xm_stations_by_id and time.monotonic() - self._xm_station_refresh < 6 * 3600:
+            return
+        url = f"{XMPLAYLIST_BASE_URL}/api/station"
+        stations: dict[str, dict[str, str]] = {}
+        for _ in range(10):
+            response = await client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+            for station in payload.get("results", []):
+                station_id = str(station.get("id", ""))
+                if station_id:
+                    station_row = {
+                        "name": str(station.get("name", "")),
+                        "number": clean_channel_number(station.get("number", "")),
+                        "deeplink": str(station.get("deeplink", "")),
+                        "image": str(station.get("imageUrl") or ""),
+                    }
+                    # /api/station uses a UUID in `id`, while /api/feed uses
+                    # the station `deeplink` string in `channelId` (for example
+                    # "thepulse" or "poprocks").  Index by both values so live
+                    # feed rows resolve correctly.
+                    stations[station_id] = station_row
+                    if station_row["deeplink"]:
+                        stations[station_row["deeplink"]] = station_row
+            next_url = payload.get("next")
+            if not next_url:
+                break
+            url = urljoin(f"{XMPLAYLIST_BASE_URL}/", str(next_url))
+        self._xm_stations_by_id = stations
+        self._xm_station_refresh = time.monotonic()
+
+    async def _refresh_xmplaylist(self) -> None:
+        headers = {"User-Agent": DISPATCHARR_USER_AGENT}
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
+            await self._refresh_xm_station_catalog(client)
+            response = await client.get(f"{XMPLAYLIST_BASE_URL}/api/feed")
+            response.raise_for_status()
+            payload = response.json()
+
+        newest: dict[str, dict[str, Any]] = {}
+        for play in payload.get("results", []):
+            channel_id = str(play.get("channelId", ""))
+            if not channel_id or channel_id not in self._xm_stations_by_id:
+                continue
+            previous = newest.get(channel_id)
+            if previous is None or str(play.get("timestamp", "")) > str(previous.get("timestamp", "")):
+                newest[channel_id] = play
+
+        fetched = time.time()
+        items: list[NowPlaying] = []
+        for channel_id, play in newest.items():
+            station = self._xm_stations_by_id[channel_id]
+            track = play.get("track") or {}
+            spotify = play.get("spotify") or {}
+            artists = track.get("artists") or []
+            if isinstance(artists, str):
+                artist = artists
+            else:
+                artist = ", ".join(str(x) for x in artists if x)
+            artwork = (
+                spotify.get("albumImageLarge")
+                or spotify.get("albumImageMedium")
+                or spotify.get("albumImageSmall")
+                or station.get("image")
+                or ""
+            )
+            items.append(
+                NowPlaying(
+                    provider="xmplaylist",
+                    channel_name=station.get("name", ""),
+                    channel_number=station.get("number", ""),
+                    artist=artist,
+                    title=str(track.get("title") or ""),
+                    album="",  # xmplaylist public feed does not expose album name
+                    artwork_url=str(artwork or ""),
+                    timestamp=str(play.get("timestamp") or ""),
+                    fetched_at=fetched,
+                )
+            )
+        self._replace_cache(items)
+
+    @staticmethod
+    def _first(obj: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in obj and obj[key] not in (None, ""):
+                return obj[key]
+        return None
+
+    @classmethod
+    def _parse_stellar_item(cls, raw: dict[str, Any]) -> NowPlaying | None:
+        channel = raw.get("channel") if isinstance(raw.get("channel"), dict) else {}
+        now = raw.get("now_playing") if isinstance(raw.get("now_playing"), dict) else (raw.get("nowPlaying") if isinstance(raw.get("nowPlaying"), dict) else {})
+        track = raw.get("track") if isinstance(raw.get("track"), dict) else (now.get("track") if isinstance(now.get("track"), dict) else now)
+        artwork_obj = raw.get("artwork") if isinstance(raw.get("artwork"), dict) else {}
+
+        channel_name = cls._first(raw, "channel_name", "channelName") or cls._first(channel, "name", "channel_name", "channelName")
+        if not channel_name and not channel:
+            candidate = raw.get("name")
+            if candidate and any(k in raw for k in ("artist", "title", "song", "track")):
+                channel_name = candidate
+        channel_number = (
+            cls._first(raw, "channel_number", "channelNumber", "number")
+            or cls._first(channel, "number", "channel_number", "channelNumber")
+            or ""
+        )
+        artist = cls._first(raw, "artist", "artist_name", "artistName") or cls._first(now, "artist", "artist_name", "artistName") or cls._first(track, "artist", "artist_name", "artistName") or ""
+        if isinstance(artist, list):
+            artist = ", ".join(str(x) for x in artist if x)
+        title = cls._first(raw, "title", "song", "song_title", "songTitle") or cls._first(now, "title", "song", "song_title", "songTitle") or cls._first(track, "title", "name", "song") or ""
+        album = cls._first(raw, "album", "album_name", "albumName") or cls._first(now, "album", "album_name", "albumName") or cls._first(track, "album", "album_name", "albumName") or ""
+        if isinstance(album, dict):
+            album = cls._first(album, "name", "title") or ""
+        artwork = (
+            cls._first(raw, "artwork_url", "artworkUrl", "image_url", "imageUrl", "album_art", "albumArt", "artwork")
+            or cls._first(now, "artwork_url", "artworkUrl", "image_url", "imageUrl", "album_art", "albumArt", "artwork")
+            or cls._first(artwork_obj, "url", "large", "medium", "small")
+            or cls._first(track, "artwork_url", "artworkUrl", "image_url", "imageUrl")
+            or ""
+        )
+        timestamp = cls._first(raw, "timestamp", "updated_at", "updatedAt", "played_at", "playedAt") or ""
+        if not channel_name:
+            return None
+        return NowPlaying(
+            provider="stellar",
+            channel_name=str(channel_name),
+            channel_number=clean_channel_number(channel_number),
+            artist=str(artist),
+            title=str(title),
+            album=str(album),
+            artwork_url=str(artwork),
+            timestamp=str(timestamp),
+            fetched_at=time.time(),
+        )
+
+    @staticmethod
+    def _stellar_rows(payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            return [x for x in payload if isinstance(x, dict)]
+        if not isinstance(payload, dict):
+            return []
+        for key in ("results", "channels", "nowplaying", "now_playing", "data", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+            if isinstance(value, dict):
+                for inner in ("results", "channels", "items"):
+                    if isinstance(value.get(inner), list):
+                        return [x for x in value[inner] if isinstance(x, dict)]
+                mapped = [x for x in value.values() if isinstance(x, dict)]
+                if mapped:
+                    return mapped
+        mapped = [x for x in payload.values() if isinstance(x, dict)]
+        return mapped if mapped else []
+
+    async def _refresh_stellar(self) -> None:
+        headers = {"User-Agent": DISPATCHARR_USER_AGENT, "X-API-Key": STELLAR_API_KEY}
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
+            response = await client.get(f"{STELLAR_BASE_URL}/nowplaying")
+            response.raise_for_status()
+            payload = response.json()
+        items = []
+        for raw in self._stellar_rows(payload):
+            item = self._parse_stellar_item(raw)
+            if item:
+                items.append(item)
+        if not items:
+            raise RuntimeError("StellarTunerLog returned no parseable now-playing rows")
+        self._replace_cache(items)
+
+    async def _refresh_ticker_channels(self, client: httpx.AsyncClient) -> None:
+        if self._ticker_channels and time.monotonic() - self._ticker_channels_refreshed < TICKER_CHANNEL_REFRESH_SECONDS:
+            return
+        response = await client.get(TICKER_CHANNEL_URL)
+        response.raise_for_status()
+        payload = response.json()
+        raw = payload.get("channels", {}) if isinstance(payload, dict) else {}
+        if isinstance(raw, dict):
+            rows = [value for value in raw.values() if isinstance(value, dict)]
+        elif isinstance(raw, list):
+            rows = [value for value in raw if isinstance(value, dict)]
+        else:
+            rows = []
+        if not rows:
+            raise RuntimeError("Ticker channels feed returned no channels")
+        self._ticker_channels = rows
+        self._ticker_channels_refreshed = time.monotonic()
+
+    @staticmethod
+    def _ticker_norm(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+    @classmethod
+    def _ticker_items(cls, channel_rows: list[dict[str, Any]], stations: dict[str, Any], fetched: float | None = None) -> list[NowPlaying]:
+        fetched = fetched or time.time()
+        items: list[NowPlaying] = []
+        non_song = {"talk", "exp", "perm", "pgm_segment", "link", "spot", "promo"}
+        useful_program = {"talk", "pgm_segment", "exp", "perm", "link"}
+        for row in channel_rows:
+            deeplink = str(row.get("deeplink_id") or row.get("deeplink") or row.get("id") or "").strip()
+            if not deeplink:
+                continue
+            live = stations.get(deeplink)
+            if not isinstance(live, dict):
+                continue
+            cut_type = str(live.get("cut_type") or "").lower()
+            artist = str(live.get("artist") or "")
+            title = str(live.get("title") or "")
+            if cut_type in non_song and cut_type not in useful_program:
+                artist = ""
+                title = ""
+            channel_name = str(row.get("name") or live.get("channel_name") or deeplink)
+            number = clean_channel_number(row.get("channel_number") or row.get("number") or "")
+            artwork = str(live.get("artwork_url") or live.get("image_url") or live.get("image") or row.get("artwork_url") or row.get("image_url") or row.get("logo") or "")
+            items.append(NowPlaying(
+                provider="ticker", channel_name=channel_name, channel_number=number,
+                artist=artist, title=title, album=str(live.get("album") or ""),
+                artwork_url=artwork, timestamp=str(live.get("timestamp") or live.get("updated_at") or ""),
+                fetched_at=fetched,
+            ))
+        return items
+
+    async def _refresh_ticker(self) -> None:
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.3"}
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
+            await self._refresh_ticker_channels(client)
+            response = await client.get(TICKER_NOWPLAYING_URL)
+            response.raise_for_status()
+            payload = response.json()
+        stations = payload.get("stations", {}) if isinstance(payload, dict) else {}
+        if not isinstance(stations, dict) or not stations:
+            raise RuntimeError("Ticker now-playing feed returned no stations")
+        items = self._ticker_items(self._ticker_channels, stations, fetched=time.time())
+        if not items:
+            raise RuntimeError("Ticker now-playing feed had no matchable station rows")
+        self._replace_cache(items)
+
+    def get(self, channel: Channel) -> NowPlaying | None:
+        item = None
+        if channel.channel_number:
+            item = self.items_by_number.get(clean_channel_number(channel.channel_number))
+        if item is None:
+            item = self.items_by_name.get(normalize_name(channel.name))
+        if item is None:
+            return None
+        if item.fetched_at and time.time() - item.fetched_at > METADATA_STALE_SECONDS:
+            return None
+        return item
+
+    def get_icy_block(self, channel: Channel) -> bytes | None:
+        # Local, non-blocking cache lookup only. If the corresponding metadata
+        # is stale, do not inject an old song into a newly playing stream.
+        item = self.get(channel)
+        if item is None:
+            return None
+        if channel.channel_number:
+            block = self._icy_by_number.get(clean_channel_number(channel.channel_number))
+            if block is not None:
+                return block
+        return self._icy_by_name.get(normalize_name(channel.name))
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": METADATA_ENABLED,
+            "icy_metadata_enabled": ICY_METADATA_ENABLED,
+            "provider": self.provider,
+            "active_source": self.active_source,
+            "fallback_provider": self.fallback_provider if self.provider == "ticker" else "",
+            "ticker_active_poll_seconds": TICKER_ACTIVE_POLL_SECONDS if self.provider == "ticker" else None,
+            "ticker_idle_poll_seconds": TICKER_IDLE_POLL_SECONDS if self.provider == "ticker" else None,
+            "ticker_polling_active": self._ticker_polling_active if self.provider == "ticker" else None,
+            "channels_cached": len(self.items_by_name),
+            "last_update": self.last_update,
+            "last_error": self.last_error,
+        }
+
+
+catalog = ChannelCatalog()
+metadata_service = MetadataService()
+stream_manager = StreamManager()
+ma_sync_service = MusicAssistantSyncService()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        initial_channels = await catalog.refresh(force=True)
+        if MA_AUTO_SYNC and MA_SYNC_ON_START and not catalog.last_error:
+            ma_sync_service.request_sync(initial_channels, reason="startup")
+    except Exception as exc:
+        LOGGER.warning("Initial channel catalog load failed: %s", exc)
+    await catalog.start()
+    await metadata_service.start()
+    try:
+        yield
+    finally:
+        await catalog.stop()
+        await metadata_service.stop()
+        await ma_sync_service.stop()
+        await stream_manager.stop()
+
+
+app = FastAPI(title=APP_NAME, version="5.3.0", lifespan=lifespan)
+
+
+def _channel_source_url(channel: Channel) -> str:
+    """Return the source URL selected by the active catalog provider."""
+    source = channel.source_url.strip()
+    if source.startswith(("http://", "https://")):
+        return source
+    base = XC_BASE_URL if SOURCE_MODE == "xc" else DISPATCHARR_BASE_URL
+    return urljoin(f"{base}/", source.lstrip("/"))
+
+
+_audio_codec_cache: dict[str, tuple[float, str]] = {}
+
+
+async def probe_audio_codec(channel: Channel, force: bool = False) -> str:
+    """Return the first audio codec name for a channel, cached for a day by default.
+
+    XC/Dispatcharr catalogs describe channels but do not guarantee the audio codec.
+    Music Assistant probes radio URLs when adding them, so an invalid AAC stream-copy
+    fails immediately with EOF. Probe once and only use copy when the source is AAC.
+    """
+    now = time.monotonic()
+    cached = _audio_codec_cache.get(channel.channel_id)
+    if not force and cached and now - cached[0] < AUDIO_CODEC_CACHE_SECONDS:
+        return cached[1]
+
+    source = _channel_source_url(channel)
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-rw_timeout", str(int(SOURCE_RW_TIMEOUT_SECONDS * 1_000_000)),
+        "-user_agent", DISPATCHARR_USER_AGENT,
+        "-probesize", "128k",
+        "-analyzeduration", "1000000",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        source,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=AAC_PROBE_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        LOGGER.warning("Audio codec probe timed out for %s", channel.channel_id)
+        codec = ""
+    else:
+        codec = stdout.decode(errors="replace").strip().splitlines()[0].lower() if stdout.strip() else ""
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()
+            if detail:
+                LOGGER.warning("Audio codec probe failed for %s: %s", channel.channel_id, detail[-300:])
+            codec = ""
+    _audio_codec_cache[channel.channel_id] = (now, codec)
+    return codec
+
+
+_upstream_semaphore = asyncio.Semaphore(UPSTREAM_MAX_CONNECTIONS)
+
+
+def build_ffmpeg_command(channel: Channel, fmt: str, source_codec: str = "", force_transcode: bool = False) -> list[str]:
+    source = _channel_source_url(channel)
+    common = [
+        "ffmpeg", "-hide_banner", "-loglevel", FFMPEG_LOG_LEVEL, "-nostdin",
+        # Input tuning for live MPEG-TS/HLS audio sources.
+        "-fflags", "+nobuffer+discardcorrupt", "-flags", "low_delay",
+        "-probesize", "128k", "-analyzeduration", "1000000",
+        "-rw_timeout", str(int(SOURCE_RW_TIMEOUT_SECONDS * 1_000_000)),
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
+        "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "408,429,5xx",
+        "-reconnect_delay_max", "2", "-user_agent", DISPATCHARR_USER_AGENT,
+        "-i", source, "-map", "0:a:0?", "-vn", "-sn", "-dn",
+    ]
+    if fmt == "aac":
+        mode = AAC_MODE if AAC_MODE in {"auto", "copy", "transcode"} else "auto"
+        use_copy = (not force_transcode) and (mode == "copy" or (mode == "auto" and source_codec == "aac"))
+        if use_copy:
+            return common + ["-c:a", "copy", "-f", "adts", "pipe:1"]
+        # Reliable fallback for MP2/AC3/E-AC3/unknown XC sources.
+        return common + [
+            "-ac", CHANNELS, "-ar", SAMPLE_RATE,
+            "-c:a", "aac", "-b:a", AAC_BITRATE, "-f", "adts", "pipe:1"
+        ]
+    if fmt == "mp3":
+        return common + [
+            "-ac", CHANNELS, "-ar", SAMPLE_RATE,
+            "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", "pipe:1"
+        ]
+    raise ValueError(f"Unsupported format: {fmt}")
+
+
+async def _drain_stderr(stream: asyncio.StreamReader | None, channel_id: str, diagnostic_callback=None) -> None:
+    if stream is None:
+        return
+    while True:
+        line = await stream.readline()
+        if not line:
+            return
+        raw = line.decode(errors="replace").rstrip()
+        safe = redact_secrets(raw)
+        # Intentional process termination during linger/container shutdown is not
+        # an upstream failure and should not look alarming in normal logs.
+        if "Immediate exit requested" in raw or "Exiting normally, received signal" in raw:
+            LOGGER.debug("ffmpeg[%s]: %s", channel_id[:8], safe)
+            continue
+        if diagnostic_callback:
+            if "HTTP error 503" in raw:
+                diagnostic_callback("http_503")
+            elif "HTTP error" in raw:
+                diagnostic_callback("http_error")
+        LOGGER.warning("ffmpeg[%s]: %s", channel_id[:8], safe)
+
+
+async def ffmpeg_audio_stream(channel: Channel, fmt: str, force_transcode: bool = False, diagnostic_callback=None) -> AsyncIterator[bytes]:
+    """Run one FFmpeg process for the life of an active v5 hub.
+
+    FFmpeg owns HTTP reconnects internally. The bridge does not kill a healthy
+    process because of a short read stall; it only respawns after FFmpeg exits.
+    """
+    channel_id = channel.channel_id
+    source_codec = ""
+    if fmt == "aac" and AAC_MODE == "auto" and not force_transcode:
+        source_codec = await probe_audio_codec(channel)
+    cmd = build_ffmpeg_command(channel, fmt, source_codec=source_codec, force_transcode=force_transcode)
+    audio_mode = "copy" if fmt == "aac" and "copy" in cmd else "transcode"
+    LOGGER.info(
+        "Starting v5 %s stream for %s (%s): source_codec=%s mode=%s chunk=%d",
+        fmt, channel.name, channel_id, source_codec or "unknown", audio_mode, STREAM_READ_CHUNK_BYTES
+    )
+    await _upstream_semaphore.acquire()
+    proc = None
+    stderr_task = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=256 * 1024
+        )
+        stderr_task = asyncio.create_task(_drain_stderr(proc.stderr, channel_id, diagnostic_callback))
+        assert proc.stdout is not None
+        while True:
+            chunk = await proc.stdout.read(STREAM_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            yield chunk
+        return_code = await proc.wait()
+        if return_code != 0:
+            LOGGER.warning("ffmpeg exited with code %s for %s", return_code, channel_id)
+    except asyncio.CancelledError:
+        LOGGER.info("Stopping v5 stream for channel %s", channel_id)
+        raise
+    finally:
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except asyncio.CancelledError:
+                pass
+        _upstream_semaphore.release()
+        LOGGER.info("Stopped v5 stream for channel %s", channel_id)
+
+
+async def ffmpeg_silence_stream(fmt: str) -> AsyncIterator[bytes]:
+    """Generate realtime-paced encoded silence matching the bridge output format."""
+    if fmt not in {"aac", "mp3"}:
+        raise ValueError(f"Unsupported silence format: {fmt}")
+    common = [
+        "ffmpeg", "-hide_banner", "-loglevel", FFMPEG_LOG_LEVEL, "-nostdin",
+        "-re", "-f", "lavfi",
+        "-i", f"anullsrc=channel_layout=stereo:sample_rate={SAMPLE_RATE}",
+        "-vn", "-sn", "-dn", "-ac", CHANNELS, "-ar", SAMPLE_RATE,
+    ]
+    if fmt == "aac":
+        cmd = common + ["-c:a", "aac", "-b:a", AAC_BITRATE, "-f", "adts", "pipe:1"]
+    else:
+        cmd = common + ["-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", "pipe:1"]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=256 * 1024
+    )
+    stderr_task = asyncio.create_task(_drain_stderr(proc.stderr, "silence"))
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = await proc.stdout.read(STREAM_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            yield chunk
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        stderr_task.cancel()
+        try:
+            await stderr_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _first_real_audio(channel: Channel, fmt: str, delay: float = 0.0, diagnostic_callback=None) -> tuple[AsyncIterator[bytes], bytes]:
+    """Open a real source and return its generator plus first audio chunk."""
+    if delay:
+        await asyncio.sleep(delay)
+    # v5: Dispatcharr's recommended audio profile guarantees AAC-LC, 48 kHz,
+    # stereo. Generate startup silence with the same parameters, then allow the
+    # real AAC source to use stream-copy so we do not perform a second AAC encode.
+    # MP3 still transcodes normally.
+    gen = ffmpeg_audio_stream(channel, fmt, force_transcode=False, diagnostic_callback=diagnostic_callback)
+    try:
+        first = await anext(gen)
+    except BaseException:
+        await gen.aclose()
+        raise
+    return gen, first
+
+
+async def startup_protected_audio_stream(
+    channel: Channel,
+    fmt: str,
+    real_audio_event: asyncio.Event | None = None,
+    diagnostic_callback=None,
+) -> AsyncIterator[bytes]:
+    """v5 startup protection: silence only until the one FFmpeg process has audio.
+
+    After the first real chunk, FFmpeg remains alive and owns reconnect behavior.
+    REAL_AUDIO_STALL_SECONDS is diagnostic-only in v5 and never kills/restarts FFmpeg.
+    """
+    if not STARTUP_SILENCE_ENABLED:
+        async for chunk in ffmpeg_audio_stream(channel, fmt, diagnostic_callback=diagnostic_callback):
+            if real_audio_event is not None:
+                real_audio_event.set()
+            yield chunk
+        return
+
+    silence_gen = ffmpeg_silence_stream(fmt)
+    real_gen = ffmpeg_audio_stream(channel, fmt, diagnostic_callback=diagnostic_callback)
+    real_task = asyncio.create_task(anext(real_gen))
+    silence_task = asyncio.create_task(anext(silence_gen))
+    LOGGER.info("Serving startup silence for %s while v5 FFmpeg starts", channel.name)
+    try:
+        while True:
+            done, _ = await asyncio.wait({real_task, silence_task}, return_when=asyncio.FIRST_COMPLETED)
+            if real_task in done:
+                try:
+                    first = real_task.result()
+                except StopAsyncIteration as exc:
+                    raise RuntimeError("FFmpeg exited before producing real audio") from exc
+                if silence_task and not silence_task.done():
+                    silence_task.cancel()
+                    try:
+                        await silence_task
+                    except (asyncio.CancelledError, StopAsyncIteration):
+                        pass
+                await silence_gen.aclose()
+                if real_audio_event is not None:
+                    real_audio_event.set()
+                LOGGER.info("Real audio ready for %s; switching from silence and keeping v5 FFmpeg alive", channel.name)
+                yield first
+                async for chunk in real_gen:
+                    yield chunk
+                return
+            if silence_task in done:
+                try:
+                    chunk = silence_task.result()
+                except StopAsyncIteration as exc:
+                    raise RuntimeError("startup silence generator stopped unexpectedly") from exc
+                yield chunk
+                silence_task = asyncio.create_task(anext(silence_gen))
+    finally:
+        if real_task and not real_task.done():
+            real_task.cancel()
+            try:
+                await real_task
+            except asyncio.CancelledError:
+                pass
+        if silence_task and not silence_task.done():
+            silence_task.cancel()
+            try:
+                await silence_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await real_gen.aclose()
+        except Exception:
+            pass
+        try:
+            await silence_gen.aclose()
+        except Exception:
+            pass
+
+
+def _icy_escape(value: str) -> str:
+    return str(value or "").replace("\'", "'").replace("'", "\\'").replace(";", ",")
+
+
+def _encode_icy_payload(payload: bytes) -> bytes:
+    payload = payload[:4080]
+    blocks = min(255, (len(payload) + 15) // 16)
+    payload = payload[: blocks * 16]
+    return bytes([blocks]) + payload.ljust(blocks * 16, b"\0")
+
+
+def _icy_block_for_now_playing(meta: NowPlaying) -> bytes:
+    parts = [f"StreamTitle='{_icy_escape(meta.stream_title)}';"]
+    if meta.album:
+        parts.append(f"StreamAlbum='{_icy_escape(meta.album)}';")
+    if meta.artwork_url:
+        parts.append(f"StreamUrl='{_icy_escape(meta.artwork_url)}';")
+    parts.append(f"StreamProvider='{_icy_escape(meta.provider)}';")
+    return _encode_icy_payload("".join(parts).encode("utf-8"))
+
+
+def build_icy_block(channel: Channel) -> bytes:
+    # This path is intentionally network-free and allocation-light. Metadata
+    # polling builds the blocks in the background and atomically swaps them in.
+    cached = metadata_service.get_icy_block(channel)
+    if cached is not None:
+        return cached
+    return _encode_icy_payload(f"StreamTitle='{_icy_escape(channel.name)}';".encode("utf-8"))
+
+
+async def with_icy_metadata(source: AsyncIterator[bytes], channel: Channel) -> AsyncIterator[bytes]:
+    """Frame ICY metadata without ever awaiting metadata-provider work.
+
+    Audio byte accounting is exact: exactly ICY_METAINT audio bytes are emitted
+    between metadata blocks. Provider updates only replace cached block bytes;
+    they cannot pause, resize, or back-pressure the shared upstream hub.
+    """
+    buffer = bytearray()
+    async for chunk in source:
+        if not chunk:
+            continue
+        buffer.extend(chunk)
+        while len(buffer) >= ICY_METAINT:
+            yield bytes(buffer[:ICY_METAINT])
+            del buffer[:ICY_METAINT]
+            yield build_icy_block(channel)
+    if buffer:
+        yield bytes(buffer)
+
+def channel_json(channel: Channel) -> dict[str, Any]:
+    now_playing = metadata_service.get(channel)
+    return {
+        "id": channel.channel_id,
+        "name": channel.name,
+        "group": channel.group,
+        "logo": channel.logo,
+        "tvg_id": channel.tvg_id,
+        "channel_number": channel.channel_number,
+        "dispatcharr_id": channel.dispatcharr_id,
+        "metadata_match_key": normalize_name(channel.name),
+        "matched_metadata_channel": now_playing.channel_name if now_playing else "",
+        "resolved_sirius_channel_number": now_playing.channel_number if now_playing else channel.channel_number,
+        "mp3_url": channel.bridge_url("mp3"),
+        "aac_url": channel.bridge_url("aac"),
+        "now_playing": now_playing.public_dict() if now_playing else None,
+    }
+
+
+
+async def _timed_json_get(url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None, verify: bool = True) -> dict[str, Any]:
+    started = time.monotonic()
+    async with httpx.AsyncClient(timeout=API_CHECK_TIMEOUT, follow_redirects=True, headers=headers or {}, verify=verify) as client:        response = await client.get(url, params=params)
+    elapsed = round((time.monotonic() - started) * 1000, 1)
+    result: dict[str, Any] = {"ok": response.is_success, "http_status": response.status_code, "latency_ms": elapsed}
+    if response.is_success:
+        try:
+            result["json"] = response.json()
+        except ValueError:
+            result["content_type"] = response.headers.get("content-type", "")
+            result["bytes"] = len(response.content)
+    else:
+        result["error"] = redact_secrets(response.text[:300])
+    return result
+
+
+async def _check_source_api() -> dict[str, Any]:
+    if SOURCE_MODE == "xc":
+        if not (XC_BASE_URL and XC_USERNAME and XC_PASSWORD):
+            return {"status": "fail", "mode": "xc", "error": "XC_BASE_URL/XC_USERNAME/XC_PASSWORD not fully configured"}
+        url = f"{XC_BASE_URL}/player_api.php"
+        base = {"username": XC_USERNAME, "password": XC_PASSWORD}
+        headers = {"User-Agent": DISPATCHARR_USER_AGENT}
+        auth, categories, streams = await asyncio.gather(
+            _timed_json_get(url, params=base, headers=headers, verify=XC_VERIFY_SSL),
+            _timed_json_get(url, params={**base, "action": "get_live_categories"}, headers=headers, verify=XC_VERIFY_SSL),
+            _timed_json_get(url, params={**base, "action": "get_live_streams"}, headers=headers, verify=XC_VERIFY_SSL),
+        )
+        user_info = auth.get("json", {}).get("user_info", {}) if isinstance(auth.get("json"), dict) else {}
+        authenticated = str(user_info.get("auth", "0")) == "1"
+        category_rows = categories.get("json") if isinstance(categories.get("json"), list) else []
+        stream_rows = streams.get("json") if isinstance(streams.get("json"), list) else []
+        ok = bool(auth.get("ok") and categories.get("ok") and streams.get("ok") and authenticated)
+        return {
+            "status": "ok" if ok else "fail", "mode": "xc", "base_url": XC_BASE_URL,
+            "authenticated": authenticated,
+            "auth": {k: v for k, v in auth.items() if k != "json"},
+            "live_categories": {**{k: v for k, v in categories.items() if k != "json"}, "count": len(category_rows)},
+            "live_streams": {**{k: v for k, v in streams.items() if k != "json"}, "count": len(stream_rows)},
+            "filtered_catalog_count": len(catalog.channels),
+        }
+    source_url = DISPATCHARR_M3U_URL or f"{DISPATCHARR_BASE_URL}{DISPATCHARR_M3U_PATH}"
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=API_CHECK_TIMEOUT, follow_redirects=True) as client:
+            response = await client.get(source_url, headers={"User-Agent": DISPATCHARR_USER_AGENT})
+        return {
+            "status": "ok" if response.is_success else "fail", "mode": "dispatcharr", "url": source_url,
+            "http_status": response.status_code, "latency_ms": round((time.monotonic()-started)*1000,1),
+            "playlist_bytes": len(response.content), "filtered_catalog_count": len(catalog.channels),
+        }
+    except Exception as exc:
+        return {"status": "fail", "mode": "dispatcharr", "url": source_url, "error": redact_secrets(exc)}
+
+
+async def _check_music_assistant() -> dict[str, Any]:
+    if not MUSIC_ASSISTANT_URL or not MUSIC_ASSISTANT_TOKEN:
+        return {"status": "disabled", "configured": False}
+    started = time.monotonic()
+    try:
+        rows = await ma_sync_service._call("music/radios/library_items", {"limit": 1, "offset": 0, "summary": True})
+        return {
+            "status": "ok", "configured": True, "authenticated": True,
+            "radio_library_read": isinstance(rows, list), "latency_ms": round((time.monotonic()-started)*1000,1),
+            "builtin_add_radio": "not_mutated_by_health_check",
+            "radio_remove_permission": "not_mutated_by_health_check",
+        }
+    except Exception as exc:
+        return {"status": "fail", "configured": True, "authenticated": False, "latency_ms": round((time.monotonic()-started)*1000,1), "error": redact_secrets(exc)}
+
+
+async def _check_ticker() -> dict[str, Any]:
+    headers = {"User-Agent": DISPATCHARR_USER_AGENT}
+    try:
+        channels, now = await asyncio.gather(
+            _timed_json_get(TICKER_CHANNEL_URL, headers=headers),
+            _timed_json_get(TICKER_NOWPLAYING_URL, headers=headers),
+        )
+        cp = channels.get("json")
+        np = now.get("json")
+        raw_channels = cp.get("channels", {}) if isinstance(cp, dict) else {}
+        raw_stations = np.get("stations", {}) if isinstance(np, dict) else {}
+        channel_count = len(raw_channels) if isinstance(raw_channels, (dict, list)) else 0
+        station_count = len(raw_stations) if isinstance(raw_stations, dict) else 0
+        ok = bool(channels.get("ok") and now.get("ok") and channel_count and station_count)
+        return {
+            "status": "ok" if ok else "fail",
+            "channels": {**{k:v for k,v in channels.items() if k != "json"}, "count": channel_count},
+            "now_playing": {**{k:v for k,v in now.items() if k != "json"}, "count": station_count},
+            "polling_active": metadata_service.status().get("ticker_polling_active"),
+            "cached_matches": len(metadata_service.items_by_name),
+        }
+    except Exception as exc:
+        return {"status": "fail", "error": redact_secrets(exc)}
+
+
+async def _check_xmplaylist() -> dict[str, Any]:
+    headers = {"User-Agent": DISPATCHARR_USER_AGENT}
+    try:
+        stations, feed = await asyncio.gather(
+            _timed_json_get(f"{XMPLAYLIST_BASE_URL}/api/station", headers=headers),
+            _timed_json_get(f"{XMPLAYLIST_BASE_URL}/api/feed", headers=headers),
+        )
+        sp = stations.get("json") if isinstance(stations.get("json"), dict) else {}
+        fp = feed.get("json") if isinstance(feed.get("json"), dict) else {}
+        sc = len(sp.get("results", [])) if isinstance(sp.get("results"), list) else 0
+        fc = len(fp.get("results", [])) if isinstance(fp.get("results"), list) else 0
+        ok = bool(stations.get("ok") and feed.get("ok"))
+        return {"status": "ok" if ok else "fail", "stations": {**{k:v for k,v in stations.items() if k != "json"}, "page_count": sc}, "feed": {**{k:v for k,v in feed.items() if k != "json"}, "rows": fc}}
+    except Exception as exc:
+        return {"status": "fail", "error": redact_secrets(exc)}
+
+
+async def _run_process_check(*cmd: str) -> tuple[bool, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=API_CHECK_TIMEOUT)
+        return proc.returncode == 0, out.decode(errors="replace")
+    except Exception as exc:
+        return False, str(exc)
+
+
+async def _check_ffmpeg() -> dict[str, Any]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffmpeg_path:
+        return {"status": "fail", "ffmpeg_present": False, "ffprobe_present": bool(ffprobe_path)}
+    ok_ver, ver = await _run_process_check(ffmpeg_path, "-version")
+    ok_enc, enc = await _run_process_check(ffmpeg_path, "-hide_banner", "-encoders")
+    version_line = ver.splitlines()[0] if ver else ""
+    return {
+        "status": "ok" if ok_ver and ffprobe_path else "fail", "ffmpeg_present": True, "ffprobe_present": bool(ffprobe_path),
+        "version": version_line, "aac_encoder": bool(ok_enc and re.search(r"\baac\b", enc)),
+        "libmp3lame_encoder": bool(ok_enc and "libmp3lame" in enc), "aac_mode": AAC_MODE,
+    }
+
+
+def _check_bridge_local() -> dict[str, Any]:
+    cache = Path(BRIDGE_CACHE_FILE) if BRIDGE_CACHE_FILE else None
+    cache_parent = cache.parent if cache else None
+    writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
+    return {
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.3.0",
+        "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
+        "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
+        "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
+        "streams": stream_manager.status(),
+    }
+
+
+async def run_api_checks() -> dict[str, Any]:
+    started = time.monotonic()
+    source, ma, ticker, xm, ffmpeg = await asyncio.gather(
+        _check_source_api(), _check_music_assistant(), _check_ticker(), _check_xmplaylist(), _check_ffmpeg()
+    )
+    checks = {"source": source, "music_assistant": ma, "ticker": ticker, "xmplaylist": xm, "ffmpeg": ffmpeg, "bridge": _check_bridge_local()}
+    failed = [name for name, row in checks.items() if isinstance(row, dict) and row.get("status") == "fail"]
+    return {"status": "ok" if not failed else "degraded", "checked_at": utc_now_iso(), "duration_ms": round((time.monotonic()-started)*1000,1), "failed": failed, "checks": checks}
+
+
+@app.get("/")
+async def index():
+    source = {"mode": SOURCE_MODE}
+    if SOURCE_MODE == "xc":
+        source.update({"base_url": XC_BASE_URL, "output": XC_OUTPUT})
+    else:
+        source.update({"playlist": DISPATCHARR_M3U_URL or f"{DISPATCHARR_BASE_URL}{DISPATCHARR_M3U_PATH}"})
+    return {
+        "name": APP_NAME,
+        "source": source,
+        "public_base_url": PUBLIC_BASE_URL,
+        "default_format": DEFAULT_FORMAT,
+        "catalog": catalog.status(),
+        "metadata": metadata_service.status(),
+        "music_assistant_sync": ma_sync_service.status(),
+        "endpoints": {
+            "health": "/health",
+            "channels": "/channels",
+            "playlist_m3u8": "/playlist.m3u8",
+            "playlist_m3u": "/playlist.m3u",
+            "metadata": "/metadata/<channel-id>",
+            "probe": "/probe/<channel-id>",
+            "catalog_refresh": "/catalog/refresh",
+            "music_assistant_sync": "/ma/sync",
+            "music_assistant_status": "/ma/status",
+            "stream_status": "/streams",
+            "api_checks": "/api/checks",
+            "api_checks_run": "/api/checks/run",
+            "stream_check": "/api/checks/stream/<channel-id>",
+            "mp3_stream": "/stream/<channel-id>.mp3",
+            "aac_stream": "/stream/<channel-id>.aac",
+        },
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "catalog": catalog.status(),
+        "metadata": metadata_service.status(),
+        "music_assistant_sync": ma_sync_service.status(),
+        "playback": {
+            "startup_silence_enabled": STARTUP_SILENCE_ENABLED,
+            "icy_metadata_enabled": ICY_METADATA_ENABLED,
+            "icy_metaint": ICY_METAINT,
+            "startup_silence_max_seconds": STARTUP_SILENCE_MAX_SECONDS,
+            "startup_real_audio_retries": STARTUP_REAL_AUDIO_RETRIES,
+            "startup_real_audio_retry_delay": STARTUP_REAL_AUDIO_RETRY_DELAY,
+            "source_rw_timeout_seconds": SOURCE_RW_TIMEOUT_SECONDS,
+            "aac_mode_configured": AAC_MODE,
+            "aac_playback_mode": AAC_MODE,
+            "aac_bitrate": AAC_BITRATE,
+            "sample_rate": SAMPLE_RATE,
+            "channels": CHANNELS,
+            "stream_linger_seconds": STREAM_LINGER_SECONDS,
+            "subscriber_queue_chunks": STREAM_SUBSCRIBER_QUEUE_CHUNKS,
+            "stream_read_chunk_bytes": STREAM_READ_CHUNK_BYTES,
+            "stream_ring_buffer_seconds": STREAM_RING_BUFFER_SECONDS,
+            "upstream_retry_initial_seconds": UPSTREAM_RETRY_INITIAL_SECONDS,
+            "upstream_retry_max_seconds": UPSTREAM_RETRY_MAX_SECONDS,
+            "upstream_retry_forever_while_listening": UPSTREAM_RETRY_FOREVER_WHILE_LISTENING,
+            "real_audio_stall_seconds": REAL_AUDIO_STALL_SECONDS,
+            "stream_restart_delay": STREAM_RESTART_DELAY,
+            "upstream_max_connections": UPSTREAM_MAX_CONNECTIONS,
+            "real_audio_stall_seconds_diagnostic_only": REAL_AUDIO_STALL_SECONDS,
+            "ma_import_release_grace_seconds": MA_IMPORT_RELEASE_GRACE_SECONDS,
+        },
+        "streams": stream_manager.status(),
+    }
+
+
+@app.post("/catalog/refresh")
+async def refresh_catalog():
+    channels = await catalog.refresh(force=True)
+    if MA_AUTO_SYNC and MA_SYNC_AFTER_CATALOG_REFRESH and not catalog.last_error:
+        ma_sync_service.request_sync(channels, reason="manual-catalog-refresh")
+    return {
+        "status": "ok",
+        "channels": len(channels),
+        "catalog": catalog.status(),
+        "music_assistant_sync": ma_sync_service.status(),
+    }
+
+
+@app.get("/ma/status")
+async def ma_sync_status():
+    return ma_sync_service.status()
+
+
+@app.post("/ma/sync")
+async def sync_music_assistant():
+    channels = await catalog.refresh()
+    if not MUSIC_ASSISTANT_TOKEN:
+        raise HTTPException(status_code=400, detail="MUSIC_ASSISTANT_TOKEN is empty")
+    try:
+        result = await ma_sync_service.sync(channels, reason="manual-api")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "ok", "music_assistant_sync": result}
+
+
+@app.get("/api/checks")
+async def api_checks():
+    return await run_api_checks()
+
+
+@app.post("/api/checks/run")
+async def api_checks_run():
+    return await run_api_checks()
+
+
+@app.get("/api/checks/stream/{channel_id}")
+async def api_check_stream(channel_id: str, live: bool = Query(False)):
+    channel = await catalog.get(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel is not present in the filtered source catalog")
+    result: dict[str, Any] = {
+        "status": "ok", "channel_id": channel.channel_id, "name": channel.name, "source_mode": SOURCE_MODE,
+        "metadata": metadata_service.get(channel).public_dict() if metadata_service.get(channel) else None,
+        "live_test_requested": live,
+    }
+    active = [row for row in stream_manager.status().get("hubs", []) if row.get("channel_id") == channel_id]
+    result["active_hubs"] = active
+    if not live:
+        result["live_test"] = "not_run; add ?live=true to open/warm the source"
+        return result
+    started = time.monotonic()
+    try:
+        async with stream_manager.hold_warm(channel, IMPORT_FORMAT) as hub:
+            result["startup_ms"] = round((time.monotonic()-started)*1000, 1)
+            result["hub"] = hub.status()
+            result["source_codec"] = await probe_audio_codec(channel)
+    except Exception as exc:
+        result["status"] = "fail"
+        result["error"] = redact_secrets(exc)
+    return result
+
+
+@app.get("/streams")
+async def stream_status():
+    return stream_manager.status()
+
+
+@app.get("/channels")
+async def channels():
+    parsed = await catalog.refresh()
+    return JSONResponse([channel_json(item) for item in parsed])
+
+
+@app.get("/probe/{channel_id}")
+async def probe_channel(channel_id: str):
+    channel = await catalog.get(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel is not present in the filtered source catalog")
+    codec = await probe_audio_codec(channel, force=True)
+    selected_mode = "transcode"
+    if AAC_MODE == "copy" or (AAC_MODE == "auto" and codec == "aac"):
+        selected_mode = "copy"
+    return {
+        "id": channel.channel_id,
+        "name": channel.name,
+        "source_codec": codec or "unknown",
+        "aac_mode": AAC_MODE,
+        "selected_aac_mode": selected_mode,
+        "aac_bitrate": AAC_BITRATE,
+        "startup_silence_enabled": STARTUP_SILENCE_ENABLED,
+        "startup_silence_max_seconds": STARTUP_SILENCE_MAX_SECONDS,
+    }
+
+
+@app.get("/metadata/{channel_id}")
+async def metadata(channel_id: str):
+    channel = await catalog.get(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel is not present in the filtered source catalog")
+    now_playing = metadata_service.get(channel)
+    return {
+        "channel": channel_json(channel),
+        "metadata_status": metadata_service.status(),
+        "now_playing": now_playing.public_dict() if now_playing else None,
+    }
+
+
+async def _playlist_response(fmt: str) -> PlainTextResponse:
+    parsed = await catalog.refresh()
+    lines = ["#EXTM3U", "#PLAYLIST:SiriusXM Radio"]
+    for item in parsed:
+        attrs = []
+        if item.tvg_id:
+            attrs.append(f'tvg-id="{item.tvg_id}"')
+        attrs.append(f'tvg-name="{item.name}"')
+        if item.channel_number:
+            attrs.append(f'tvg-chno="{item.channel_number}"')
+        if item.logo:
+            attrs.append(f'tvg-logo="{item.logo}"')
+        if item.group:
+            attrs.append(f'group-title="{item.group}"')
+        attr_text = " " + " ".join(attrs)
+        lines.append(f"#EXTINF:-1{attr_text},{item.name}")
+        lines.append(item.bridge_url(fmt))
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="audio/x-mpegurl")
+
+
+@app.get("/playlist.m3u")
+async def playlist_m3u(fmt: str = Query(DEFAULT_FORMAT, pattern="^(mp3|aac)$")):
+    return await _playlist_response(fmt)
+
+
+@app.get("/playlist.m3u8")
+async def playlist_m3u8(fmt: str = Query(DEFAULT_FORMAT, pattern="^(mp3|aac)$")):
+    return await _playlist_response(fmt)
+
+
+@app.get("/stream/{channel_id}.{fmt}")
+async def stream(request: Request, channel_id: str, fmt: str):
+    if not re.fullmatch(r"(?:[0-9a-fA-F-]{36}|xc-\d+)", channel_id):
+        raise HTTPException(status_code=400, detail="Invalid channel id")
+    fmt = fmt.lower()
+    if fmt not in {"mp3", "aac"}:
+        raise HTTPException(status_code=404, detail="Use .mp3 or .aac")
+
+    channel = await catalog.get(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel is not present in the filtered source catalog")
+
+    wants_icy = METADATA_ENABLED and ICY_METADATA_ENABLED and request.headers.get("icy-metadata", "0").strip() == "1"
+    media_type = "audio/mpeg" if fmt == "mp3" else "audio/aac"
+    headers = {
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache",
+        "X-Accel-Buffering": "no",
+        "icy-name": channel.name,
+        "icy-description": f"{channel.name} via {SOURCE_MODE.upper()}",
+    }
+    if channel.logo:
+        headers["icy-logo"] = channel.logo
+    # Subscribers share one persistent upstream per channel+format. A brief MA
+    # disconnect/reconnect therefore does not tear down the Dispatcharr session.
+    audio = stream_manager.subscribe(channel, fmt)
+    if wants_icy:
+        headers["icy-metaint"] = str(ICY_METAINT)
+        body = with_icy_metadata(audio, channel)
+    else:
+        body = audio
+
+    return StreamingResponse(body, media_type=media_type, headers=headers)
