@@ -529,7 +529,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.4.0"
+    assert row["version"] == "5.5.0"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
