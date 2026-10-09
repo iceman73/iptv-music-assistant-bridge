@@ -64,6 +64,14 @@ curl http://YOUR-BRIDGE-HOST:8088/health
 
 The default bridge port is **8088**.
 
+The Docker Compose project explicitly names the local image:
+
+```text
+iceman73/iptv-music-assistant-bridge:latest
+```
+
+The container name remains `dispatcharr-ma-bridge`.
+
 ### Docker base image mirror
 
 The project defaults Docker builds to Google's Docker Hub mirror:
