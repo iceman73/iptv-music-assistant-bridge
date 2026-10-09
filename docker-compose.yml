@@ -1,5 +1,6 @@
 services:
   dispatcharr-ma-bridge:
+    image: iceman73/iptv-music-assistant-bridge:latest
     build:
       context: .
       args:
