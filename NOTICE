@@ -1,0 +1,20 @@
+IPTV Music Assistant Bridge
+Copyright 2026 Chris Stocker
+
+Licensed under the Apache License, Version 2.0.
+
+This project is an independent integration tool. It is not affiliated with,
+sponsored by, or endorsed by Dispatcharr, Music Assistant, SiriusXM, Amazon,
+StellarTunerLog, xmplaylist, or their respective owners.
+
+Dispatcharr, Music Assistant, SiriusXM, Amazon, Echo, StellarTunerLog,
+xmplaylist, and other product or service names are the property of their
+respective owners.
+
+The project license covers only the source code and documentation in this
+repository. It does not grant rights to third-party audio streams, logos,
+channel artwork, metadata, trademarks, subscription services, or other content.
+
+Users are responsible for complying with the terms, licensing requirements,
+and service agreements of the systems and content sources they connect to this
+software.
