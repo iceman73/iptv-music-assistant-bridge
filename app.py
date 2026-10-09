@@ -997,7 +997,8 @@ class MusicAssistantSyncService:
         async with httpx.AsyncClient(timeout=MA_SYNC_TIMEOUT, follow_redirects=True) as client:
             response = await client.post(f"{MUSIC_ASSISTANT_URL}/api", json=payload, headers=headers)
         if response.status_code >= 400:
-            detail = response.text.strip()            if len(detail) > 300:
+            detail = response.text.strip()
+            if len(detail) > 300:
                 detail = detail[:300] + "..."
             raise RuntimeError(f"MA {command} failed HTTP {response.status_code}: {detail}")
         if not response.content:
@@ -1996,7 +1997,8 @@ def channel_json(channel: Channel) -> dict[str, Any]:
 
 async def _timed_json_get(url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None, verify: bool = True) -> dict[str, Any]:
     started = time.monotonic()
-    async with httpx.AsyncClient(timeout=API_CHECK_TIMEOUT, follow_redirects=True, headers=headers or {}, verify=verify) as client:        response = await client.get(url, params=params)
+    async with httpx.AsyncClient(timeout=API_CHECK_TIMEOUT, follow_redirects=True, headers=headers or {}, verify=verify) as client:
+        response = await client.get(url, params=params)
     elapsed = round((time.monotonic() - started) * 1000, 1)
     result: dict[str, Any] = {"ok": response.is_success, "http_status": response.status_code, "latency_ms": elapsed}
     if response.is_success:
