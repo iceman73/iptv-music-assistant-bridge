@@ -128,7 +128,7 @@ docker compose up -d --build
 Create a Dispatcharr stream profile named **audio_only** and use:
 
 ```text
--user_agent {userAgent} -i {streamUrl} -vn -map 0:a:0 -c:a aac -b:a 128k -ar 48000 -ac 2 -probesize 500000 -analyzeduration 1000000 -fflags +discardcorrupt+nobuffer -flags low_delay -af aresample=async=1 -muxdelay 0 -muxpreload 0 -f mpegts pipe:1
+-user_agent {userAgent} -i {streamUrl} -vn -map 0:a:0 -c:a aac -b:a 128k -ar 48000 -ac 2 -probesize 1000000 -analyzeduration 2000000 -fflags +discardcorrupt+nobuffer -flags low_delay -af aresample=async=1 -muxdelay 0 -muxpreload 0 -f mpegts pipe:1
 ```
 
 This profile:
