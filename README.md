@@ -139,6 +139,7 @@ This profile:
 - normalizes to 48 kHz stereo
 - uses MPEG-TS for the Dispatcharr output
 - keeps the stream suitable for the bridge's `AAC_MODE=copy` path
+- lets FFmpeg reconnect across transient source interruptions while avoiding low-latency flags that can create gaps with burst-delivered audio
 
 If your provider is already stable AAC, this avoids an additional audio encode inside the bridge.
 
