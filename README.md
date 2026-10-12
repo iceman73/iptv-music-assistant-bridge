@@ -328,6 +328,8 @@ v5.6.1 prevents a source that repeatedly returns HTTP errors from occupying one 
 
 After first real audio is established, FFmpeg still owns normal reconnect behavior.
 
+After a Music Assistant add/update finishes its release-grace window, a listener-free import-only warmup hub is released immediately instead of entering the normal 30-second playback linger. This keeps serial catalog syncs from consuming both upstream slots with completed imports.
+
 ### v5.4 stream write smoothing
 
 FFmpeg can return very small encoded reads even when the bridge asks the pipe for 16 KB. In v5.4 the bridge keeps codec data unchanged but coalesces adjacent encoded reads before broadcasting them to Music Assistant and hardware players. The default target is 8 KB with a 0.5-second maximum hold time. Startup silence and real audio are never combined in the same coalesced write.
