@@ -908,26 +908,36 @@ class SharedStreamHub:
             metadata_service.notify_stream_activity()
             LOGGER.info("Pinned %s; listeners=%d pins=%d", self.key, len(self.subscribers), self.pins)
 
-    async def unpin(self, stop_if_unready: bool = False) -> None:
+    async def unpin(self, stop_if_unready: bool = False, stop_if_idle: bool = False) -> None:
         task_to_stop: asyncio.Task | None = None
+        stop_reason = ""
         async with self.lock:
             self.pins = max(0, self.pins - 1)
             LOGGER.info("Unpinned %s; listeners=%d pins=%d", self.key, len(self.subscribers), self.pins)
-            if (
-                stop_if_unready
-                and not self.real_audio_ready.is_set()
-                and not self.subscribers
+            idle_running_hub = (
+                not self.subscribers
                 and not self.pins
                 and self.task
                 and not self.task.done()
-            ):
+            )
+            if idle_running_hub and stop_if_idle:
                 task_to_stop = self.task
+                stop_reason = "import warmup complete"
+                self._cancel_linger_locked()
+                self.state = "idle"
+            elif idle_running_hub and stop_if_unready and not self.real_audio_ready.is_set():
+                task_to_stop = self.task
+                stop_reason = "failed cold start"
                 self._cancel_linger_locked()
                 self.state = "source_error"
             else:
                 self._schedule_linger_locked()
         if task_to_stop:
-            LOGGER.info("Stopping failed cold-start hub %s immediately to release upstream capacity", self.key)
+            LOGGER.info(
+                "Stopping hub %s immediately (%s) to release upstream capacity",
+                self.key,
+                stop_reason,
+            )
             task_to_stop.cancel()
             try:
                 await task_to_stop
@@ -1080,7 +1090,11 @@ class StreamManager:
             yield hub
         finally:
             if not released:
-                await hub.unpin()
+                # MA import warmups are synthetic demand. Once the add/grace
+                # window is over, do not leave a listener-free warmup hub in
+                # the normal playback linger period or it can consume one of
+                # the scarce upstream slots needed by the next station.
+                await hub.unpin(stop_if_idle=True)
 
     def has_active_hubs(self) -> bool:
         return any(hub.task and not hub.task.done() for hub in self.hubs.values())
@@ -1341,8 +1355,8 @@ class MusicAssistantSyncService:
                     except Exception as exc:
                         add_failures += 1
                         if len(failed_radios) < 25:
-                            failed_radios.append({"name": channel.name, "url": url, "error": str(exc)[:300]})
-                        LOGGER.warning("Could not add/update MA radio %s: %s", channel.name, exc)
+                            failed_radios.append({"name": channel.name, "url": url, "error": exception_detail(exc)[:300]})
+                        LOGGER.warning("Could not add/update MA radio %s: %s", channel.name, exception_detail(exc))
 
                 # Format migration is independent of MA_REMOVE_MISSING. Only remove
                 # the old format after the desired station is confirmed present so
