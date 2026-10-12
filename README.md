@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6**
+Current release: **v5.6.1**
 
 ## Features
 
@@ -23,6 +23,7 @@ Current release: **v5.6**
 - Optional ICY artist/title injection
 - Automatic Music Assistant radio synchronization
 - Automatic AAC/MP3 format migration for bridge-managed Music Assistant stations
+- Bounded cold-start acquisition so failed sources release scarce upstream slots
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
@@ -253,6 +254,7 @@ MA_REMOVE_MISSING=false
 | `SAMPLE_RATE` | `48000` | Output sample rate |
 | `CHANNELS` | `2` | Output audio channels |
 | `SOURCE_RW_TIMEOUT_SECONDS` | `60` | Upstream read timeout |
+| `UPSTREAM_STARTUP_TIMEOUT_SECONDS` | `30` | Maximum time an initial source attempt may wait for first real audio before it is recycled |
 | `UPSTREAM_MAX_CONNECTIONS` | `2` | Maximum simultaneous upstream streams |
 | `STREAM_LINGER_SECONDS` | `30` | Keep a hub hot after the final listener leaves |
 | `STREAM_SUBSCRIBER_QUEUE_CHUNKS` | `16` | Per-listener queue depth |
@@ -314,7 +316,17 @@ ICY_METADATA_ENABLED=false
 | `MA_ADD_RETRIES` | `3` | Add-radio retry count |
 | `MA_SYNC_CONCURRENCY` | `1` | Number of stations imported concurrently |
 | `STREAM_WARMUP_ENABLED` | `true` | Warm new streams before MA validates them |
+| `STREAM_WARMUP_RETRIES` | `2` | Cold-start warmup attempts before MA reports a failure and frees the hub immediately |
+| `STREAM_WARMUP_TIMEOUT` | `45` | Maximum wait per MA warmup attempt for real audio |
 | `MA_IMPORT_RELEASE_GRACE_SECONDS` | `11` | Keep a stream pinned briefly after MA accepts it |
+
+### v5.6.1 cold-start recovery
+
+v5.6.1 prevents a source that repeatedly returns HTTP errors from occupying one of the limited upstream connection slots indefinitely during initial acquisition. Before first real audio, each source attempt is bounded by `UPSTREAM_STARTUP_TIMEOUT_SECONDS`. Music Assistant warmups retry according to `STREAM_WARMUP_RETRIES`, and a final warmup timeout immediately tears down an unused cold-start hub rather than leaving it in the normal linger window.
+
+`/streams` now separates current-attempt diagnostics from lifetime counters and reports `state`, `waiting_for_upstream_slot`, `current_attempt_number`, `current_attempt_started_at`, `current_attempt_http_503_count`, and `current_attempt_http_error_count`. Current-attempt timestamps and the encoded ring buffer are reset when a new upstream attempt starts, so stale audio and historical timestamps do not appear as current data.
+
+After first real audio is established, FFmpeg still owns normal reconnect behavior.
 
 ### v5.4 stream write smoothing
 
