@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.5")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -77,8 +77,9 @@ TICKER_IDLE_POLL_SECONDS = max(0.0, float(os.getenv("TICKER_IDLE_POLL_SECONDS", 
 TICKER_CHANNEL_REFRESH_SECONDS = max(3600, int(os.getenv("TICKER_CHANNEL_REFRESH_SECONDS", "86400")))
 METADATA_FALLBACK = os.getenv("METADATA_FALLBACK", "xmplaylist").strip().lower()
 
-# Music Assistant radio synchronization. builtin/add_radio is idempotent by URL,
-# so a sync safely updates names/images while adding any new bridge stations.
+# Music Assistant radio synchronization. Bridge-managed station identity is based
+# on channel_id, not the current stream extension. This lets format changes such
+# as AAC -> MP3 migrate the same station without leaving stale MA radio entries.
 MUSIC_ASSISTANT_URL = os.getenv("MUSIC_ASSISTANT_URL", "http://music-assistant:8095").strip().rstrip("/")
 MUSIC_ASSISTANT_TOKEN = os.getenv("MUSIC_ASSISTANT_TOKEN", "").strip().strip('"').strip("'")
 IMPORT_FORMAT = os.getenv("IMPORT_FORMAT", DEFAULT_FORMAT).strip().lower()
@@ -1005,6 +1006,9 @@ class MusicAssistantSyncService:
         self.last_failed_radios: list[dict[str, str]] = []
         self.last_removed_count = 0
         self.last_remove_failures = 0
+        self.last_migrated_count = 0
+        self.last_stale_format_removed_count = 0
+        self.last_migration_failures = 0
 
     @property
     def enabled(self) -> bool:
@@ -1096,6 +1100,24 @@ class MusicAssistantSyncService:
                     return item_id
         return ""
 
+    @staticmethod
+    def _managed_channel_id_from_url(url: str) -> str:
+        """Return the bridge channel id from a managed AAC/MP3 URL."""
+        if not url.startswith(MA_MANAGED_URL_PREFIX):
+            return ""
+        tail = url[len(MA_MANAGED_URL_PREFIX):].split("?", 1)[0]
+        match = re.fullmatch(r"(.+)\.(?:aac|mp3)", tail, flags=re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    async def _remove_managed_radio_item(self, item: dict[str, Any]) -> None:
+        library_id = item.get("item_id")
+        if library_id in (None, ""):
+            raise RuntimeError("Managed Music Assistant radio is missing item_id")
+        await self._call(
+            "music/radios/remove",
+            {"item_id": library_id, "recursive": True},
+        )
+
     async def _managed_library_radios(self) -> list[dict[str, Any]]:
         managed: list[dict[str, Any]] = []
         offset = 0
@@ -1143,61 +1165,106 @@ class MusicAssistantSyncService:
             raise RuntimeError("Refusing to sync an empty source catalog")
         async with self.lock:
             desired = {ch.bridge_url(IMPORT_FORMAT): ch for ch in channels}
+            desired_channel_ids = {ch.channel_id for ch in channels}
             self.last_desired_count = len(desired)
             self.last_reason = reason
 
-            # Always read bridge-managed MA radios so unchanged stations can be
-            # skipped. This avoids warming/re-probing the entire catalog every day.
+            # Read all bridge-managed radios once. Exact URL matches are used to
+            # skip unchanged stations; channel-id matches detect format migrations.
             existing_managed = await self._managed_library_radios()
             existing_by_url = {
                 self._managed_url_from_item(item): item
                 for item in existing_managed
                 if self._managed_url_from_item(item)
             }
+            existing_by_channel_id: dict[str, list[dict[str, Any]]] = {}
+            for item in existing_managed:
+                managed_url = self._managed_url_from_item(item)
+                channel_id = self._managed_channel_id_from_url(managed_url)
+                if channel_id:
+                    existing_by_channel_id.setdefault(channel_id, []).append(item)
 
             synced = 0
             unchanged = 0
             add_failures = 0
             failed_radios: list[dict[str, str]] = []
+            migrated = 0
+            stale_format_removed = 0
+            migration_failures = 0
+            removed_item_ids: set[str] = set()
+
             # Intentionally sequential by default. Dispatcharr may need to fill its
             # cache for a cold channel; parallel warm-ups can stampede upstream.
             if MA_SYNC_CONCURRENCY != 1:
-                LOGGER.warning("MA_SYNC_CONCURRENCY=%d requested; v5 serializes warm/import operations for source safety", MA_SYNC_CONCURRENCY)
+                LOGGER.warning(
+                    "MA_SYNC_CONCURRENCY=%d requested; v5 serializes warm/import operations for source safety",
+                    MA_SYNC_CONCURRENCY,
+                )
+
             for url, channel in desired.items():
                 existing = existing_by_url.get(url)
-                if existing and _existing_radio_name(existing) == channel.name:
+                siblings = existing_by_channel_id.get(channel.channel_id, [])
+                stale_format_items = [
+                    item for item in siblings
+                    if self._managed_url_from_item(item) != url
+                ]
+
+                desired_ready = bool(existing and _existing_radio_name(existing) == channel.name)
+                if desired_ready:
                     unchanged += 1
-                    continue
-                args: dict[str, Any] = {"url": url, "name": channel.name}
-                if IMPORT_LOGOS and channel.logo:
-                    args["image_url"] = channel.logo
-                try:
-                    await self._add_radio_with_warm_source(channel, args)
-                    synced += 1
-                except Exception as exc:
-                    add_failures += 1
-                    if len(failed_radios) < 25:
-                        failed_radios.append({"name": channel.name, "url": url, "error": str(exc)[:300]})
-                    LOGGER.warning("Could not add/update MA radio %s: %s", channel.name, exc)
+                else:
+                    args: dict[str, Any] = {"url": url, "name": channel.name}
+                    if IMPORT_LOGOS and channel.logo:
+                        args["image_url"] = channel.logo
+                    try:
+                        await self._add_radio_with_warm_source(channel, args)
+                        synced += 1
+                        desired_ready = True
+                    except Exception as exc:
+                        add_failures += 1
+                        if len(failed_radios) < 25:
+                            failed_radios.append({"name": channel.name, "url": url, "error": str(exc)[:300]})
+                        LOGGER.warning("Could not add/update MA radio %s: %s", channel.name, exc)
+
+                # Format migration is independent of MA_REMOVE_MISSING. Only remove
+                # the old format after the desired station is confirmed present so
+                # a failed MP3/AAC add never destroys the last playable MA entry.
+                if desired_ready and stale_format_items:
+                    channel_migration_failed = False
+                    for item in stale_format_items:
+                        try:
+                            await self._remove_managed_radio_item(item)
+                            stale_format_removed += 1
+                            removed_item_ids.add(str(item.get("item_id")))
+                        except Exception as exc:
+                            channel_migration_failed = True
+                            migration_failures += 1
+                            LOGGER.warning(
+                                "Could not remove stale-format MA radio %s for %s: %s",
+                                self._managed_url_from_item(item),
+                                channel.name,
+                                exc,
+                            )
+                    if not channel_migration_failed:
+                        migrated += 1
 
             removed = 0
             remove_failures = 0
             if MA_REMOVE_MISSING:
-                desired_urls = set(desired)
                 for item in existing_managed:
-                    managed_url = self._managed_url_from_item(item)
-                    if not managed_url or managed_url in desired_urls:
+                    item_id = str(item.get("item_id"))
+                    if item_id in removed_item_ids:
                         continue
-                    library_id = item.get("item_id")
-                    if library_id in (None, ""):
+                    managed_url = self._managed_url_from_item(item)
+                    if not managed_url:
+                        continue
+                    channel_id = self._managed_channel_id_from_url(managed_url)
+                    if channel_id and channel_id in desired_channel_ids:
+                        continue
+                    if not channel_id and managed_url in desired:
                         continue
                     try:
-                        # Current MA radio controller exposes music/radios/remove.
-                        # This requires Library Manage scope on the token.
-                        await self._call(
-                            "music/radios/remove",
-                            {"item_id": library_id, "recursive": True},
-                        )
+                        await self._remove_managed_radio_item(item)
                         removed += 1
                     except Exception as exc:
                         remove_failures += 1
@@ -1209,18 +1276,28 @@ class MusicAssistantSyncService:
             self.last_failed_radios = failed_radios
             self.last_removed_count = removed
             self.last_remove_failures = remove_failures
+            self.last_migrated_count = migrated
+            self.last_stale_format_removed_count = stale_format_removed
+            self.last_migration_failures = migration_failures
             self.last_sync_at = utc_now_iso()
             errors = []
             if add_failures:
                 errors.append(f"{add_failures} radio add/update(s) failed")
+            if migration_failures:
+                errors.append(f"{migration_failures} format migration cleanup(s) failed")
             if remove_failures:
                 errors.append(f"{remove_failures} stale radio removal(s) failed")
             self.last_error = "; ".join(errors)
             LOGGER.info(
-                "Music Assistant sync complete: %d add/update, %d unchanged, %d add failure(s), %d removed, %d removal failure(s)",
+                "Music Assistant sync complete: %d add/update, %d unchanged, %d add failure(s), "
+                "%d migrated, %d stale-format removed, %d migration failure(s), "
+                "%d missing removed, %d removal failure(s)",
                 synced,
                 unchanged,
                 add_failures,
+                migrated,
+                stale_format_removed,
+                migration_failures,
                 removed,
                 remove_failures,
             )
@@ -1246,11 +1323,13 @@ class MusicAssistantSyncService:
             "unchanged_count": self.last_unchanged_count,
             "add_failures": self.last_add_failures,
             "failed_radios": self.last_failed_radios,
+            "migrated_count": self.last_migrated_count,
+            "stale_format_removed_count": self.last_stale_format_removed_count,
+            "migration_failures": self.last_migration_failures,
             "removed_count": self.last_removed_count,
             "remove_failures": self.last_remove_failures,
             "sync_in_progress": bool(self.task and not self.task.done()),
         }
-
 
 class MetadataService:
     def __init__(self) -> None:
@@ -1612,7 +1691,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.5"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -1691,7 +1770,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.5.0", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.0", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2208,7 +2287,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.5.0",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.0",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
