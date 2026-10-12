@@ -356,6 +356,15 @@ AAC endpoints remain available. If you explicitly prefer AAC for another player,
 
 ## Music Assistant setup
 
+### Automatic format migration
+
+Starting with v5.6, bridge-managed Music Assistant stations are matched by channel ID instead of the full AAC or MP3 URL. When `IMPORT_FORMAT` changes, the bridge confirms the desired format first, then removes the stale format entry for that same channel.
+
+Format migration cleanup runs independently of `MA_REMOVE_MISSING`. That setting is now reserved for channels that disappear from the source catalog. If the desired-format add fails, the existing old-format station is left in place.
+
+`/ma/status` now reports `migrated_count`, `stale_format_removed_count`, and `migration_failures`.
+
+
 With automatic synchronization enabled, the bridge can add/update the filtered stations itself.
 
 Force a manual sync:
