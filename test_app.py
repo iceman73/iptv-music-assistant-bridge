@@ -658,3 +658,59 @@ def test_upstream_state_tracks_slot_and_http_errors():
     assert hub.state == "source_error"
     assert hub.current_attempt_http_503_count == 1
     assert hub.current_attempt_http_error_count == 1
+
+
+def test_import_warmup_release_stops_idle_hub_without_linger():
+    async def run():
+        hub = app.SharedStreamHub(Channel(channel_id="xc-3", name="Import Test"), "mp3")
+        hub.pins = 1
+        hub.real_audio_ready.set()
+
+        async def sleeper():
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(sleeper())
+        hub.task = task
+        await hub.unpin(stop_if_idle=True)
+
+        assert hub.pins == 0
+        assert task.done()
+        assert hub.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_normal_unpin_still_uses_linger():
+    async def run():
+        old_linger = app.STREAM_LINGER_SECONDS
+        try:
+            app.STREAM_LINGER_SECONDS = 30
+            hub = app.SharedStreamHub(Channel(channel_id="xc-4", name="Playback Test"), "mp3")
+            hub.pins = 1
+
+            async def sleeper():
+                await asyncio.sleep(60)
+
+            task = asyncio.create_task(sleeper())
+            hub.task = task
+            await hub.unpin()
+
+            assert hub.pins == 0
+            assert not task.done()
+            assert hub.linger_task is not None
+            assert not hub.linger_task.done()
+
+            hub.linger_task.cancel()
+            try:
+                await hub.linger_task
+            except asyncio.CancelledError:
+                pass
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            app.STREAM_LINGER_SECONDS = old_linger
+
+    asyncio.run(run())
