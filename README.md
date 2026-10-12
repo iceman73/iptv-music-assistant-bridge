@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.5**
+Current release: **v5.6**
 
 ## Features
 
@@ -22,6 +22,7 @@ Current release: **v5.5**
 - xmplaylist fallback
 - Optional ICY artist/title injection
 - Automatic Music Assistant radio synchronization
+- Automatic AAC/MP3 format migration for bridge-managed Music Assistant stations
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
