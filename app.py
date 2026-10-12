@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.1")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -98,6 +98,7 @@ STREAM_WARMUP_TIMEOUT = max(5.0, float(os.getenv("STREAM_WARMUP_TIMEOUT", "45"))
 STREAM_WARMUP_RETRIES = max(1, int(os.getenv("STREAM_WARMUP_RETRIES", "2")))
 STREAM_WARMUP_RETRY_DELAY = max(0.0, float(os.getenv("STREAM_WARMUP_RETRY_DELAY", "2")))
 SOURCE_RW_TIMEOUT_SECONDS = max(15.0, float(os.getenv("SOURCE_RW_TIMEOUT_SECONDS", "60")))
+UPSTREAM_STARTUP_TIMEOUT_SECONDS = max(5.0, float(os.getenv("UPSTREAM_STARTUP_TIMEOUT_SECONDS", "30")))
 
 # Playback startup protection. Dispatcharr can take time to establish/cache a cold
 # upstream stream. While that happens, serve correctly paced encoded silence so
@@ -165,6 +166,13 @@ def redact_secrets(value: Any) -> str:
         except Exception:
             pass
     return text
+
+
+def exception_detail(exc: BaseException) -> str:
+    """Return a useful redacted exception string, including normally-empty timeouts."""
+    detail = redact_secrets(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {detail}" if detail else name
 
 
 def utc_now_iso() -> str:
@@ -634,22 +642,54 @@ class SharedStreamHub:
         self.upstream_http_error_count = 0
         self.recovery_count = 0
         self.silence_fallback_count = 0
+        self.current_attempt_http_503_count = 0
+        self.current_attempt_http_error_count = 0
+        self.current_attempt_number = 0
+        self.current_attempt_started_at = ""
+        self.state = "idle"
+        self.waiting_for_upstream_slot = False
         self._ring_buffer: deque[tuple[float, bytes]] = deque()
 
     @property
     def key(self) -> str:
         return f"{self.channel.channel_id}:{self.fmt}"
 
+    def _reset_attempt_diagnostics(self) -> None:
+        self.current_attempt_number += 1
+        self.current_attempt_started_at = utc_now_iso()
+        self.current_attempt_http_503_count = 0
+        self.current_attempt_http_error_count = 0
+        self.last_chunk_at = ""
+        self.last_real_chunk_at = ""
+        self._last_chunk_monotonic = 0.0
+        self._last_real_chunk_monotonic = 0.0
+        self._rate_window.clear()
+        self._ring_buffer.clear()
+        self.waiting_for_upstream_slot = False
+        self.state = "starting_upstream"
+
     def record_upstream_event(self, event: str) -> None:
-        if event == "http_503":
+        if event == "waiting_for_slot":
+            self.waiting_for_upstream_slot = True
+            self.state = "waiting_for_slot"
+        elif event == "slot_acquired":
+            self.waiting_for_upstream_slot = False
+            self.state = "starting_upstream"
+        elif event == "http_503":
             self.upstream_http_503_count += 1
             self.upstream_http_error_count += 1
+            self.current_attempt_http_503_count += 1
+            self.current_attempt_http_error_count += 1
+            self.state = "source_error"
         elif event == "http_error":
             self.upstream_http_error_count += 1
+            self.current_attempt_http_error_count += 1
+            self.state = "source_error"
         elif event == "recovered":
             self.recovery_count += 1
         elif event == "silence_fallback":
             self.silence_fallback_count += 1
+
 
     def _cancel_linger_locked(self) -> None:
         if self.linger_task and not self.linger_task.done():
@@ -728,6 +768,8 @@ class SharedStreamHub:
         self.last_chunk_at = now_iso
         self._last_chunk_monotonic = now_mono
         if real_audio:
+            self.state = "real_audio"
+            self.waiting_for_upstream_slot = False
             self.real_audio_bytes += size
             self.real_audio_chunks += 1
             self.last_real_chunk_at = now_iso
@@ -764,6 +806,7 @@ class SharedStreamHub:
             while True:
                 self.real_audio_ready.clear()
                 self.last_real_audio_at = ""
+                self._reset_attempt_diagnostics()
                 try:
                     async def tagged_stream() -> AsyncIterator[tuple[bytes, bool]]:
                         async for chunk in startup_protected_audio_stream(
@@ -783,8 +826,9 @@ class SharedStreamHub:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    self.last_error = redact_secrets(exc)
-                    LOGGER.warning("Shared upstream error for %s (%s): %s", self.channel.name, self.fmt, redact_secrets(exc))
+                    self.last_error = exception_detail(exc)
+                    self.state = "source_error"
+                    LOGGER.warning("Shared upstream error for %s (%s): %s", self.channel.name, self.fmt, self.last_error)
 
                 async with self.lock:
                     demand = bool(self.subscribers or self.pins)
@@ -816,6 +860,9 @@ class SharedStreamHub:
                     queue.put_nowait(None)
                 except asyncio.QueueFull:
                     pass
+            if not self.real_audio_ready.is_set() and self.state != "source_error":
+                self.state = "idle"
+            self.waiting_for_upstream_slot = False
             LOGGER.info("Stopped shared upstream hub for %s (%s)", self.channel.name, self.fmt)
 
     async def subscribe(self) -> AsyncIterator[bytes]:
@@ -861,11 +908,49 @@ class SharedStreamHub:
             metadata_service.notify_stream_activity()
             LOGGER.info("Pinned %s; listeners=%d pins=%d", self.key, len(self.subscribers), self.pins)
 
-    async def unpin(self) -> None:
+    async def unpin(self, stop_if_unready: bool = False) -> None:
+        task_to_stop: asyncio.Task | None = None
         async with self.lock:
             self.pins = max(0, self.pins - 1)
             LOGGER.info("Unpinned %s; listeners=%d pins=%d", self.key, len(self.subscribers), self.pins)
-            self._schedule_linger_locked()
+            if (
+                stop_if_unready
+                and not self.real_audio_ready.is_set()
+                and not self.subscribers
+                and not self.pins
+                and self.task
+                and not self.task.done()
+            ):
+                task_to_stop = self.task
+                self._cancel_linger_locked()
+                self.state = "source_error"
+            else:
+                self._schedule_linger_locked()
+        if task_to_stop:
+            LOGGER.info("Stopping failed cold-start hub %s immediately to release upstream capacity", self.key)
+            task_to_stop.cancel()
+            try:
+                await task_to_stop
+            except asyncio.CancelledError:
+                pass
+
+    async def restart_failed_warmup(self) -> bool:
+        """Restart a pinned warmup only when doing so cannot disrupt a listener."""
+        async with self.lock:
+            if self.subscribers or self.pins != 1:
+                return False
+            task = self.task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        async with self.lock:
+            if self.subscribers or self.pins != 1:
+                return False
+            self._ensure_running_locked()
+        return True
 
     async def wait_for_real_audio(self, timeout: float) -> None:
         await asyncio.wait_for(self.real_audio_ready.wait(), timeout=timeout)
@@ -898,6 +983,12 @@ class SharedStreamHub:
             "listeners": len(self.subscribers),
             "pins": self.pins,
             "real_audio_ready": self.real_audio_ready.is_set(),
+            "state": self.state,
+            "waiting_for_upstream_slot": self.waiting_for_upstream_slot,
+            "current_attempt_number": self.current_attempt_number,
+            "current_attempt_started_at": self.current_attempt_started_at,
+            "current_attempt_http_503_count": self.current_attempt_http_503_count,
+            "current_attempt_http_error_count": self.current_attempt_http_error_count,
             "linger_seconds": STREAM_LINGER_SECONDS,
             "started_at": self.started_at,
             "last_real_audio_at": self.last_real_audio_at,
@@ -956,13 +1047,40 @@ class StreamManager:
     async def hold_warm(self, channel: Channel, fmt: str) -> AsyncIterator[SharedStreamHub]:
         hub = await self._hub(channel, fmt)
         await hub.pin()
+        released = False
         try:
             if STREAM_WARMUP_ENABLED:
-                await hub.wait_for_real_audio(STREAM_WARMUP_TIMEOUT)
-                LOGGER.info("Shared stream ready for %s; holding same upstream during MA add", channel.name)
+                for attempt in range(1, STREAM_WARMUP_RETRIES + 1):
+                    try:
+                        await hub.wait_for_real_audio(STREAM_WARMUP_TIMEOUT)
+                        LOGGER.info(
+                            "Shared stream ready for %s; holding same upstream during MA add",
+                            channel.name,
+                        )
+                        break
+                    except asyncio.TimeoutError as exc:
+                        if attempt < STREAM_WARMUP_RETRIES:
+                            LOGGER.warning(
+                                "Warmup timed out for %s after %.0fs (attempt %d/%d); restarting cold source",
+                                channel.name,
+                                STREAM_WARMUP_TIMEOUT,
+                                attempt,
+                                STREAM_WARMUP_RETRIES,
+                            )
+                            restarted = await hub.restart_failed_warmup()
+                            if restarted and STREAM_WARMUP_RETRY_DELAY:
+                                await asyncio.sleep(STREAM_WARMUP_RETRY_DELAY)
+                            continue
+                        await hub.unpin(stop_if_unready=True)
+                        released = True
+                        raise RuntimeError(
+                            f"WarmupTimeout: no real audio after {STREAM_WARMUP_TIMEOUT:.0f}s "
+                            f"for {STREAM_WARMUP_RETRIES} attempt(s)"
+                        ) from exc
             yield hub
         finally:
-            await hub.unpin()
+            if not released:
+                await hub.unpin()
 
     def has_active_hubs(self) -> bool:
         return any(hub.task and not hub.task.done() for hub in self.hubs.values())
@@ -1691,7 +1809,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.1"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -1770,7 +1888,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.0", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.1", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -1837,9 +1955,10 @@ def build_ffmpeg_command(channel: Channel, fmt: str, source_codec: str = "", for
     source = _channel_source_url(channel)
     common = [
         "ffmpeg", "-hide_banner", "-loglevel", FFMPEG_LOG_LEVEL, "-nostdin",
-        # Input tuning for live MPEG-TS/HLS audio sources.
-        "-fflags", "+nobuffer+discardcorrupt", "-flags", "low_delay",
-        "-probesize", "128k", "-analyzeduration", "1000000",
+        # Stable live MPEG-TS/HLS input tuning. Avoid low-latency/nobuffer
+        # flags because burst-delivered audio can gap or fail cold starts.
+        "-fflags", "+discardcorrupt+genpts",
+        "-probesize", "1000000", "-analyzeduration", "2000000",
         "-rw_timeout", str(int(SOURCE_RW_TIMEOUT_SECONDS * 1_000_000)),
         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
         "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "408,429,5xx",
@@ -1902,7 +2021,11 @@ async def ffmpeg_audio_stream(channel: Channel, fmt: str, force_transcode: bool 
         "Starting v5 %s stream for %s (%s): source_codec=%s mode=%s chunk=%d",
         fmt, channel.name, channel_id, source_codec or "unknown", audio_mode, STREAM_READ_CHUNK_BYTES
     )
+    if diagnostic_callback:
+        diagnostic_callback("waiting_for_slot")
     await _upstream_semaphore.acquire()
+    if diagnostic_callback:
+        diagnostic_callback("slot_acquired")
     proc = None
     stderr_task = None
     try:
@@ -2022,10 +2145,28 @@ async def startup_protected_audio_stream(
     real_gen = ffmpeg_audio_stream(channel, fmt, diagnostic_callback=diagnostic_callback)
     real_task = asyncio.create_task(anext(real_gen))
     silence_task = asyncio.create_task(anext(silence_gen))
-    LOGGER.info("Serving startup silence for %s while v5 FFmpeg starts", channel.name)
+    startup_deadline = time.monotonic() + UPSTREAM_STARTUP_TIMEOUT_SECONDS
+    LOGGER.info(
+        "Serving startup silence for %s while v5 FFmpeg starts (startup timeout %.0fs)",
+        channel.name,
+        UPSTREAM_STARTUP_TIMEOUT_SECONDS,
+    )
     try:
         while True:
-            done, _ = await asyncio.wait({real_task, silence_task}, return_when=asyncio.FIRST_COMPLETED)
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"UpstreamStartupTimeout: no real audio after {UPSTREAM_STARTUP_TIMEOUT_SECONDS:.0f}s"
+                )
+            done, _ = await asyncio.wait(
+                {real_task, silence_task},
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise RuntimeError(
+                    f"UpstreamStartupTimeout: no real audio after {UPSTREAM_STARTUP_TIMEOUT_SECONDS:.0f}s"
+                )
             if real_task in done:
                 try:
                     first = real_task.result()
@@ -2287,7 +2428,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.0",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.1",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
