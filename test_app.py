@@ -177,6 +177,11 @@ def test_ffmpeg_command_reconnects_at_eof_and_transient_http_errors():
     assert "-reconnect_at_eof" in cmd and cmd[cmd.index("-reconnect_at_eof") + 1] == "1"
     assert "-reconnect_on_network_error" in cmd and cmd[cmd.index("-reconnect_on_network_error") + 1] == "1"
     assert "-reconnect_on_http_error" in cmd
+    assert "+discardcorrupt+genpts" in cmd
+    assert "+nobuffer+discardcorrupt" not in cmd
+    assert "low_delay" not in cmd
+    assert cmd[cmd.index("-probesize") + 1] == "1000000"
+    assert cmd[cmd.index("-analyzeduration") + 1] == "2000000"
 
 
 def test_shared_hub_reuses_same_upstream_during_linger():
@@ -532,7 +537,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.0"
+    assert row["version"] == "5.6.1"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -620,3 +625,36 @@ def test_ma_sync_migrates_old_format_when_remove_missing_is_off():
             app.MA_MANAGED_URL_PREFIX = old_prefix
             app.PUBLIC_BASE_URL = old_public
     asyncio.run(run())
+
+
+def test_shared_hub_current_attempt_diagnostics_reset_cleanly():
+    hub = app.SharedStreamHub(Channel(channel_id="xc-1", name="Test"), "mp3")
+    hub.last_real_chunk_at = "old"
+    hub._last_real_chunk_monotonic = 12.0
+    hub._rate_window.append((12.0, 100))
+    hub.current_attempt_http_503_count = 4
+    hub.current_attempt_http_error_count = 5
+    hub._ring_buffer.append((12.0, b"old"))
+    hub._reset_attempt_diagnostics()
+    assert hub.last_real_chunk_at == ""
+    assert hub._last_real_chunk_monotonic == 0.0
+    assert hub.current_attempt_http_503_count == 0
+    assert hub.current_attempt_http_error_count == 0
+    assert hub.state == "starting_upstream"
+    assert list(hub._rate_window) == []
+    assert list(hub._ring_buffer) == []
+
+
+def test_upstream_state_tracks_slot_and_http_errors():
+    hub = app.SharedStreamHub(Channel(channel_id="xc-2", name="Test"), "mp3")
+    hub._reset_attempt_diagnostics()
+    hub.record_upstream_event("waiting_for_slot")
+    assert hub.state == "waiting_for_slot"
+    assert hub.waiting_for_upstream_slot is True
+    hub.record_upstream_event("slot_acquired")
+    assert hub.state == "starting_upstream"
+    assert hub.waiting_for_upstream_slot is False
+    hub.record_upstream_event("http_503")
+    assert hub.state == "source_error"
+    assert hub.current_attempt_http_503_count == 1
+    assert hub.current_attempt_http_error_count == 1
