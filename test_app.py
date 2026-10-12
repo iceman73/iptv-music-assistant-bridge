@@ -529,7 +529,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.5.0"
+    assert row["version"] == "5.6.0"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -558,4 +558,62 @@ def test_coalescer_flushes_on_silence_to_real_audio_transition():
         out = [item async for item in app.coalesce_audio_chunks(src(), target_bytes=8192, max_delay_seconds=60)]
         assert out == [(b"silence", False), (b"realaudio", True)]
 
+    asyncio.run(run())
+
+
+def test_ma_channel_identity_ignores_audio_extension():
+    old_prefix = app.MA_MANAGED_URL_PREFIX
+    try:
+        app.MA_MANAGED_URL_PREFIX = "http://bridge:8088/stream/"
+        get_id = app.MusicAssistantSyncService._managed_channel_id_from_url
+        assert get_id("http://bridge:8088/stream/xc-23260.aac") == "xc-23260"
+        assert get_id("http://bridge:8088/stream/xc-23260.mp3") == "xc-23260"
+    finally:
+        app.MA_MANAGED_URL_PREFIX = old_prefix
+
+
+def test_ma_sync_migrates_old_format_when_remove_missing_is_off():
+    async def run():
+        old_format = app.IMPORT_FORMAT
+        old_remove = app.MA_REMOVE_MISSING
+        old_prefix = app.MA_MANAGED_URL_PREFIX
+        old_public = app.PUBLIC_BASE_URL
+        try:
+            app.IMPORT_FORMAT = "mp3"
+            app.MA_REMOVE_MISSING = False
+            app.MA_MANAGED_URL_PREFIX = "http://bridge:8088/stream/"
+            app.PUBLIC_BASE_URL = "http://bridge:8088"
+            service = app.MusicAssistantSyncService()
+            channel = Channel(channel_id="xc-23260", name="Classic Rewind", source_url="http://source.test/live.ts")
+            existing = {
+                "item_id": "old-aac",
+                "name": channel.name,
+                "provider_mappings": [{
+                    "provider_domain": "builtin",
+                    "provider_instance": "builtin",
+                    "item_id": "http://bridge:8088/stream/xc-23260.aac",
+                }],
+            }
+            async def managed():
+                return [existing]
+            added, removed = [], []
+            async def add_radio(ch, args):
+                added.append(args["url"])
+            async def call(command, args):
+                if command == "music/radios/remove":
+                    removed.append(args["item_id"])
+            service._managed_library_radios = managed
+            service._add_radio_with_warm_source = add_radio
+            service._call = call
+            result = await service.sync([channel], reason="migration-test")
+            assert added == ["http://bridge:8088/stream/xc-23260.mp3"]
+            assert removed == ["old-aac"]
+            assert result["migrated_count"] == 1
+            assert result["stale_format_removed_count"] == 1
+            assert result["removed_count"] == 0
+        finally:
+            app.IMPORT_FORMAT = old_format
+            app.MA_REMOVE_MISSING = old_remove
+            app.MA_MANAGED_URL_PREFIX = old_prefix
+            app.PUBLIC_BASE_URL = old_public
     asyncio.run(run())
