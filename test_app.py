@@ -165,6 +165,9 @@ def test_ma_sync_status_defaults():
     assert "managed_url_prefix" in status
     assert "add_failures" in status
     assert "failed_radios" in status
+    assert "migrated_count" in status
+    assert "stale_format_removed_count" in status
+    assert "migration_failures" in status
     assert status["synced_count"] == 0
 
 
