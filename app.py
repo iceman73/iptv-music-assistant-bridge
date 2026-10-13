@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.2")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.3")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -1358,6 +1358,57 @@ class MusicAssistantSyncService:
             "radios": rows,
         }
 
+    async def remove_all_managed_radios(self, dry_run: bool = True) -> dict[str, Any]:
+        """Remove only Music Assistant radios managed by this bridge."""
+        managed = await self._managed_library_radios()
+        targets = [
+            {
+                "item_id": str(item.get("item_id") or ""),
+                "name": _existing_radio_name(item),
+                "url": self._managed_url_from_item(item),
+            }
+            for item in managed
+        ]
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "managed_url_prefix": MA_MANAGED_URL_PREFIX,
+                "target_count": len(targets),
+                "removed_count": 0,
+                "failed_count": 0,
+                "targets": targets,
+                "failures": [],
+            }
+
+        removed = 0
+        failures: list[dict[str, str]] = []
+        for item, target in zip(managed, targets):
+            try:
+                await self._remove_managed_radio_item(item)
+                removed += 1
+            except Exception as exc:
+                failures.append({
+                    **target,
+                    "error": exception_detail(exc)[:300],
+                })
+                LOGGER.warning(
+                    "Could not remove bridge-managed MA radio %s (%s): %s",
+                    target["name"],
+                    target["url"],
+                    exception_detail(exc),
+                )
+
+        return {
+            "dry_run": False,
+            "managed_url_prefix": MA_MANAGED_URL_PREFIX,
+            "target_count": len(targets),
+            "removed_count": removed,
+            "failed_count": len(failures),
+            "targets": targets,
+            "failures": failures,
+        }
+
     async def _add_radio_with_warm_source(self, channel: Channel, args: dict[str, Any]) -> None:
         """Warm the source, keep it open through every MA add retry, then close it."""
         async with stream_manager.hold_warm(channel, IMPORT_FORMAT):
@@ -1912,7 +1963,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.2"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.3"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -1991,7 +2042,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.2", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.3", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2531,7 +2582,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.2",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.3",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
@@ -2648,6 +2699,31 @@ async def ma_radio_audit():
     channels = await catalog.refresh()
     try:
         return await ma_sync_service.audit_library_radios(channels)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/ma/radios/remove-all")
+async def ma_remove_all_radios_preview(dry_run: bool = Query(True)):
+    if not MUSIC_ASSISTANT_TOKEN:
+        raise HTTPException(status_code=400, detail="MUSIC_ASSISTANT_TOKEN is empty")
+    if not dry_run:
+        raise HTTPException(
+            status_code=400,
+            detail="GET is preview-only; use POST /ma/radios/remove-all to remove bridge-managed radios",
+        )
+    try:
+        return await ma_sync_service.remove_all_managed_radios(dry_run=True)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/ma/radios/remove-all")
+async def ma_remove_all_radios(dry_run: bool = Query(True)):
+    if not MUSIC_ASSISTANT_TOKEN:
+        raise HTTPException(status_code=400, detail="MUSIC_ASSISTANT_TOKEN is empty")
+    try:
+        return await ma_sync_service.remove_all_managed_radios(dry_run=dry_run)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
