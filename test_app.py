@@ -1,3 +1,4 @@
+import json
 import asyncio
 import os
 
@@ -548,7 +549,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.9"
+    assert row["version"] == "5.6.10"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -1246,3 +1247,73 @@ def test_adaptive_jitter_increases_target_after_underrun():
             app.MP3_BITRATE = old_bitrate
 
     asyncio.run(asyncio.wait_for(run(), timeout=2.0))
+
+
+def test_proactive_low_water_raises_target_before_underrun():
+    async def run():
+        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
+        old_adaptive = app.STREAM_JITTER_BUFFER_ADAPTIVE
+        old_seconds = app.STREAM_JITTER_BUFFER_SECONDS
+        old_min = app.STREAM_JITTER_BUFFER_MIN_SECONDS
+        old_max = app.STREAM_JITTER_BUFFER_MAX_SECONDS
+        old_low = app.STREAM_JITTER_BUFFER_LOW_WATER_SECONDS
+        old_increase = app.STREAM_JITTER_BUFFER_INCREASE_SECONDS
+        old_bitrate = app.MP3_BITRATE
+        events = []
+
+        async def src():
+            for byte in (b"A", b"B", b"C", b"D"):
+                yield (byte * 24000, True)
+
+        try:
+            app.STREAM_JITTER_BUFFER_ENABLED = True
+            app.STREAM_JITTER_BUFFER_ADAPTIVE = True
+            app.STREAM_JITTER_BUFFER_SECONDS = 3.0
+            app.STREAM_JITTER_BUFFER_MIN_SECONDS = 1.0
+            app.STREAM_JITTER_BUFFER_MAX_SECONDS = 8.0
+            app.STREAM_JITTER_BUFFER_LOW_WATER_SECONDS = 2.0
+            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = 2.0
+            app.MP3_BITRATE = "192k"
+
+            gen = app.jitter_buffer_encoded_audio(
+                src(),
+                "mp3",
+                status_callback=lambda e, v: events.append((e, v)),
+                initial_target_seconds=3.0,
+            )
+            first = await asyncio.wait_for(anext(gen), timeout=0.5)
+            assert first == (b"A" * 24000, True)
+            assert any(event == "low_water" for event, _ in events)
+            assert any(event == "target_increase" and value == 5.0 for event, value in events)
+            await gen.aclose()
+        finally:
+            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
+            app.STREAM_JITTER_BUFFER_ADAPTIVE = old_adaptive
+            app.STREAM_JITTER_BUFFER_SECONDS = old_seconds
+            app.STREAM_JITTER_BUFFER_MIN_SECONDS = old_min
+            app.STREAM_JITTER_BUFFER_MAX_SECONDS = old_max
+            app.STREAM_JITTER_BUFFER_LOW_WATER_SECONDS = old_low
+            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = old_increase
+            app.MP3_BITRATE = old_bitrate
+
+    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
+
+
+def test_persisted_jitter_target_is_reused_for_new_hub(tmp_path):
+    old_state_file = app.STREAM_JITTER_STATE_FILE
+    old_targets = dict(app._jitter_learned_targets)
+    try:
+        app.STREAM_JITTER_STATE_FILE = str(tmp_path / "jitter-targets.json")
+        app._jitter_learned_targets.clear()
+        app._remember_jitter_target("xc-persist:mp3", 12.0)
+
+        ch = Channel(channel_id="xc-persist", name="Persist")
+        hub = app.SharedStreamHub(ch, "mp3")
+        assert hub.jitter_buffer_adaptive_target_seconds == 12.0
+
+        payload = json.loads((tmp_path / "jitter-targets.json").read_text())
+        assert payload["targets"]["xc-persist:mp3"] == 12.0
+    finally:
+        app.STREAM_JITTER_STATE_FILE = old_state_file
+        app._jitter_learned_targets.clear()
+        app._jitter_learned_targets.update(old_targets)
