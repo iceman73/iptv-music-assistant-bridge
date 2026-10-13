@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.1**
+Current release: **v5.6.2**
 
 ## Features
 
@@ -24,6 +24,7 @@ Current release: **v5.6.1**
 - Automatic Music Assistant radio synchronization
 - Automatic AAC/MP3 format migration for bridge-managed Music Assistant stations
 - Bounded cold-start acquisition so failed sources release scarce upstream slots
+- Music Assistant per-radio audit endpoint for stale AAC/MP3, duplicate, missing, and source-removed entries
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
@@ -379,6 +380,8 @@ Format migration cleanup runs independently of `MA_REMOVE_MISSING`. That setting
 
 `/ma/status` now reports `migrated_count`, `stale_format_removed_count`, and `migration_failures`.
 
+`/ma/radios` compares the current bridge catalog with the actual bridge-managed radio objects stored in Music Assistant. Each station is classified as `correct`, `wrong_format`, `duplicate`, `missing`, or `source_missing`, and the response includes the MA URL(s), desired URL, item IDs, and stale URLs. This is useful for finding old `.aac` objects after an MP3 migration.
+
 
 With automatic synchronization enabled, the bridge can add/update the filtered stations itself.
 
@@ -393,6 +396,14 @@ Check sync status:
 ```bash
 curl http://YOUR-BRIDGE-HOST:8088/ma/status
 ```
+
+Audit the actual bridge-managed radio objects stored in Music Assistant:
+
+```bash
+curl http://YOUR-BRIDGE-HOST:8088/ma/radios
+```
+
+The summary counts and per-radio `status` fields make stale AAC entries and duplicates visible without relying on aggregate sync counters.
 
 Alternatively, Music Assistant can consume the generated playlist:
 
@@ -416,6 +427,7 @@ http://YOUR-BRIDGE-HOST:8088/playlist.m3u8
 | GET | `/probe/{channel_id}` | Probe source audio codec and selected AAC mode |
 | POST | `/catalog/refresh` | Force a catalog refresh |
 | GET | `/ma/status` | Music Assistant synchronization status |
+| GET | `/ma/radios` | Audit actual bridge-managed Music Assistant radio URLs and migration state |
 | POST | `/ma/sync` | Force Music Assistant synchronization |
 | GET | `/api/checks` | Run dependency/API diagnostics |
 | POST | `/api/checks/run` | Force dependency/API diagnostics |
