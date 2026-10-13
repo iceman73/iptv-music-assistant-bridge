@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.9**
+Current release: **v5.6.10**
 
 ## Features
 
@@ -283,12 +283,14 @@ MA_REMOVE_MISSING=false
 | `STREAM_OUTPUT_PACING_SLACK_SECONDS` | `0.25` | Reset pacing after a real upstream gap instead of catching up with a burst |
 | `STREAM_JITTER_BUFFER_ENABLED` | `true` | Buffer encoded MP3 ahead of playback to absorb short upstream delivery gaps |
 | `STREAM_JITTER_BUFFER_ADAPTIVE` | `true` | Learn a working reserve independently for each active channel |
-| `STREAM_JITTER_BUFFER_MIN_SECONDS` | `2.0` | Lowest adaptive reserve target |
-| `STREAM_JITTER_BUFFER_INCREASE_SECONDS` | `2.0` | Increase the channel target by this amount after an underrun |
+| `STREAM_JITTER_BUFFER_MIN_SECONDS` | `4.0` | Lowest learned reserve target |
+| `STREAM_JITTER_BUFFER_LOW_WATER_SECONDS` | `2.0` | Raise the learned target before the current reserve reaches zero |
+| `STREAM_JITTER_BUFFER_INCREASE_SECONDS` | `2.0` | Increase the learned channel target after a low-water event or underrun |
+| `STREAM_JITTER_STATE_FILE` | `/data/jitter-targets.json` | Persist learned per-channel targets across hub recreation and container restart |
 | `STREAM_JITTER_BUFFER_DECREASE_SECONDS` | `1.0` | Reduce the channel target by this amount after a stable period |
-| `STREAM_JITTER_BUFFER_STABLE_SECONDS` | `600` | Stable playback time required before reducing the target |
-| `STREAM_JITTER_BUFFER_SECONDS` | `4.0` | Initial per-channel MP3 reserve target |
-| `STREAM_JITTER_BUFFER_MAX_SECONDS` | `16.0` | Maximum adaptive encoded MP3 reserve for a bursty channel |
+| `STREAM_JITTER_BUFFER_STABLE_SECONDS` | `900` | Stable playback time required before reducing the learned target |
+| `STREAM_JITTER_BUFFER_SECONDS` | `8.0` | Initial MP3 reserve target for a channel without learned history |
+| `STREAM_JITTER_BUFFER_MAX_SECONDS` | `20.0` | Maximum learned encoded MP3 reserve for a bursty channel |
 | `STREAM_RING_BUFFER_SECONDS` | `0.5` | Short reconnect pre-roll; reduced to limit audible repeats |
 | `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
 | `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
@@ -366,21 +368,56 @@ Live stream listeners now take priority over Music Assistant catalog warmups. Th
 
 `/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
 
+### v5.6.10 proactive Echo jitter learning
+
+v5.6.10 changes adaptive buffering so the bridge no longer waits for an actual underrun before learning that a station needs more reserve. A new station starts at 8 seconds. When the live reserve falls to the 2-second low-water mark, the bridge immediately raises and persists that channel's learned target by 2 seconds for the next clean tune or source reacquisition, up to 20 seconds.
+
+Learned targets are stored in `/data/jitter-targets.json` by default, so Classic Vinyl, 80s on 8, and other channels can retain different reserve requirements across hub recreation and container restart.
+
+An actual underrun is still recorded, but is now flagged as `jitter_buffer_corruption_risk=true` because Echo playback may remain stuttery/static after the stream reaches zero even when the bridge later refills.
+
+`/streams` adds:
+
+```text
+jitter_buffer_low_water_seconds
+jitter_buffer_low_water_events
+jitter_buffer_target_persisted
+jitter_buffer_corruption_risk
+```
+
+Recommended Echo defaults:
+
+```env
+STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_ADAPTIVE=true
+STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
+STREAM_JITTER_BUFFER_SECONDS=8.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
+STREAM_JITTER_BUFFER_LOW_WATER_SECONDS=2.0
+STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
+STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
+STREAM_JITTER_BUFFER_STABLE_SECONDS=900
+STREAM_JITTER_STATE_FILE=/data/jitter-targets.json
+POST_START_GAP_FILL_ENABLED=false
+```
+
 ### v5.6.9 adaptive per-channel jitter buffer
 
-v5.6.9 makes the MP3 reserve adaptive per active channel. Each hub starts at the configured target, increases its working reserve after a real underrun, and slowly backs the target down after sustained stable playback. This lets steadier stations run with less latency while burstier stations learn that they need more protection.
+v5.6.9 makes the MP3 reserve adaptive per active channel. Each hub starts from its persisted learned target, raises that target proactively when the live reserve crosses the low-water threshold, and slowly backs the target down after sustained stable playback. This lets steadier stations run with less latency while burstier stations learn that they need more protection before an Echo-facing stream actually underruns.
 
 Default behavior:
 
 ```env
 STREAM_JITTER_BUFFER_ENABLED=true
 STREAM_JITTER_BUFFER_ADAPTIVE=true
-STREAM_JITTER_BUFFER_MIN_SECONDS=2.0
-STREAM_JITTER_BUFFER_SECONDS=4.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=16.0
+STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
+STREAM_JITTER_BUFFER_SECONDS=8.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
+STREAM_JITTER_BUFFER_LOW_WATER_SECONDS=2.0
 STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
 STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
-STREAM_JITTER_BUFFER_STABLE_SECONDS=600
+STREAM_JITTER_BUFFER_STABLE_SECONDS=900
+STREAM_JITTER_STATE_FILE=/data/jitter-targets.json
 POST_START_GAP_FILL_ENABLED=false
 ```
 
@@ -397,12 +434,14 @@ Defaults:
 ```env
 STREAM_JITTER_BUFFER_ENABLED=true
 STREAM_JITTER_BUFFER_ADAPTIVE=true
-STREAM_JITTER_BUFFER_MIN_SECONDS=2.0
-STREAM_JITTER_BUFFER_SECONDS=4.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=16.0
+STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
+STREAM_JITTER_BUFFER_SECONDS=8.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
+STREAM_JITTER_BUFFER_LOW_WATER_SECONDS=2.0
 STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
 STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
-STREAM_JITTER_BUFFER_STABLE_SECONDS=600
+STREAM_JITTER_BUFFER_STABLE_SECONDS=900
+STREAM_JITTER_STATE_FILE=/data/jitter-targets.json
 POST_START_GAP_FILL_ENABLED=false
 ```
 
