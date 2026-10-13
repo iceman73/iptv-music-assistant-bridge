@@ -2552,7 +2552,7 @@ async def startup_protected_audio_stream(
             yield chunk
         return
 
-    silence_gen = ffmpeg_silence_stream(fmt)
+    silence_gen: AsyncIterator[bytes] | None = ffmpeg_silence_stream(fmt)
     real_gen = ffmpeg_audio_stream(channel, fmt, diagnostic_callback=diagnostic_callback)
     real_task: asyncio.Task | None = asyncio.create_task(anext(real_gen))
     silence_task: asyncio.Task | None = asyncio.create_task(anext(silence_gen))
@@ -2590,6 +2590,12 @@ async def startup_protected_audio_stream(
                     silence_task.cancel()
                     await asyncio.gather(silence_task, return_exceptions=True)
                 silence_task = None
+                if silence_gen is not None:
+                    try:
+                        await silence_gen.aclose()
+                    except Exception:
+                        pass
+                    silence_gen = None
                 if real_audio_event is not None:
                     real_audio_event.set()
                 if output_kind_callback:
@@ -2653,6 +2659,9 @@ async def startup_protected_audio_stream(
                     channel.name,
                     POST_START_GAP_FILL_AFTER_SECONDS,
                 )
+                # A cancelled anext() closes an async generator, so startup
+                # silence and each later gap-fill need their own generator.
+                silence_gen = ffmpeg_silence_stream(fmt)
                 silence_task = asyncio.create_task(anext(silence_gen))
 
             while gap_fill_active:
@@ -2670,6 +2679,12 @@ async def startup_protected_audio_stream(
                         silence_task.cancel()
                         await asyncio.gather(silence_task, return_exceptions=True)
                     silence_task = None
+                    if silence_gen is not None:
+                        try:
+                            await silence_gen.aclose()
+                        except Exception:
+                            pass
+                        silence_gen = None
                     gap_fill_active = False
                     if diagnostic_callback:
                         diagnostic_callback("gap_fill_end")
@@ -2703,10 +2718,11 @@ async def startup_protected_audio_stream(
             await real_gen.aclose()
         except Exception:
             pass
-        try:
-            await silence_gen.aclose()
-        except Exception:
-            pass
+        if silence_gen is not None:
+            try:
+                await silence_gen.aclose()
+            except Exception:
+                pass
 
 
 def _icy_escape(value: str) -> str:
