@@ -1283,6 +1283,10 @@ def test_proactive_low_water_raises_target_before_underrun():
             )
             first = await asyncio.wait_for(anext(gen), timeout=0.5)
             assert first == (b"A" * 24000, True)
+            # Low-water handling runs when the generator resumes after yielding
+            # the first chunk, so advance once more before asserting events.
+            second = await asyncio.wait_for(anext(gen), timeout=0.5)
+            assert second == (b"B" * 24000, True)
             assert any(event == "low_water" for event, _ in events)
             assert any(event == "target_increase" and value == 5.0 for event, value in events)
             await gen.aclose()
