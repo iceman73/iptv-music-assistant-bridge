@@ -548,7 +548,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.8"
+    assert row["version"] == "5.6.9"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -1194,3 +1194,55 @@ def test_jitter_buffer_passthrough_for_aac():
             app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
 
     asyncio.run(run())
+
+
+def test_adaptive_jitter_increases_target_after_underrun():
+    async def run():
+        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
+        old_adaptive = app.STREAM_JITTER_BUFFER_ADAPTIVE
+        old_seconds = app.STREAM_JITTER_BUFFER_SECONDS
+        old_min = app.STREAM_JITTER_BUFFER_MIN_SECONDS
+        old_max = app.STREAM_JITTER_BUFFER_MAX_SECONDS
+        old_increase = app.STREAM_JITTER_BUFFER_INCREASE_SECONDS
+        old_bitrate = app.MP3_BITRATE
+        events = []
+
+        async def src():
+            yield (b"A" * 24000, True)
+            await asyncio.sleep(0.03)
+            yield (b"B" * 24000, True)
+            yield (b"C" * 24000, True)
+            yield (b"D" * 24000, True)
+
+        try:
+            app.STREAM_JITTER_BUFFER_ENABLED = True
+            app.STREAM_JITTER_BUFFER_ADAPTIVE = True
+            app.STREAM_JITTER_BUFFER_SECONDS = 1.0
+            app.STREAM_JITTER_BUFFER_MIN_SECONDS = 1.0
+            app.STREAM_JITTER_BUFFER_MAX_SECONDS = 4.0
+            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = 2.0
+            app.MP3_BITRATE = "192k"
+
+            gen = app.jitter_buffer_encoded_audio(
+                src(),
+                "mp3",
+                status_callback=lambda e, v: events.append((e, v)),
+                initial_target_seconds=1.0,
+            )
+            first = await asyncio.wait_for(anext(gen), timeout=0.5)
+            assert first == (b"A" * 24000, True)
+            second = await asyncio.wait_for(anext(gen), timeout=0.5)
+            assert second == (b"B" * 24000, True)
+            assert any(event == "underrun" for event, _ in events)
+            assert any(event == "target_increase" and value == 3.0 for event, value in events)
+            await gen.aclose()
+        finally:
+            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
+            app.STREAM_JITTER_BUFFER_ADAPTIVE = old_adaptive
+            app.STREAM_JITTER_BUFFER_SECONDS = old_seconds
+            app.STREAM_JITTER_BUFFER_MIN_SECONDS = old_min
+            app.STREAM_JITTER_BUFFER_MAX_SECONDS = old_max
+            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = old_increase
+            app.MP3_BITRATE = old_bitrate
+
+    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
