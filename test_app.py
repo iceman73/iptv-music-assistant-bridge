@@ -537,7 +537,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.1"
+    assert row["version"] == "5.6.2"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -714,3 +714,73 @@ def test_normal_unpin_still_uses_linger():
             app.STREAM_LINGER_SECONDS = old_linger
 
     asyncio.run(run())
+
+
+def test_ma_radio_audit_classifies_correct_wrong_format_duplicate_and_missing():
+    async def run():
+        service = app.MusicAssistantSyncService()
+        channels = [
+            Channel(channel_id="xc-1", name="Correct"),
+            Channel(channel_id="xc-2", name="Wrong"),
+            Channel(channel_id="xc-3", name="Duplicate"),
+            Channel(channel_id="xc-4", name="Missing"),
+        ]
+
+        def item(item_id, name, url):
+            return {
+                "item_id": item_id,
+                "name": name,
+                "provider_mappings": [{
+                    "provider_domain": "builtin",
+                    "provider_instance": "builtin",
+                    "item_id": url,
+                }],
+            }
+
+        managed = [
+            item("1", "Correct", "http://localhost:8088/stream/xc-1.mp3"),
+            item("2", "Wrong", "http://localhost:8088/stream/xc-2.aac"),
+            item("3a", "Duplicate", "http://localhost:8088/stream/xc-3.mp3"),
+            item("3b", "Duplicate", "http://localhost:8088/stream/xc-3.aac"),
+            item("5", "Old Source", "http://localhost:8088/stream/xc-5.mp3"),
+        ]
+
+        old_prefix = app.MA_MANAGED_URL_PREFIX
+        old_base = app.PUBLIC_BASE_URL
+        old_fmt = app.IMPORT_FORMAT
+        try:
+            app.MA_MANAGED_URL_PREFIX = "http://localhost:8088/stream/"
+            app.PUBLIC_BASE_URL = "http://localhost:8088"
+            app.IMPORT_FORMAT = "mp3"
+
+            async def fake_managed():
+                return managed
+
+            service._managed_library_radios = fake_managed
+            result = await service.audit_library_radios(channels)
+        finally:
+            app.MA_MANAGED_URL_PREFIX = old_prefix
+            app.PUBLIC_BASE_URL = old_base
+            app.IMPORT_FORMAT = old_fmt
+
+        by_id = {row["channel_id"]: row for row in result["radios"] if row.get("channel_id")}
+        assert by_id["xc-1"]["status"] == "correct"
+        assert by_id["xc-2"]["status"] == "wrong_format"
+        assert by_id["xc-3"]["status"] == "duplicate"
+        assert by_id["xc-4"]["status"] == "missing"
+        assert by_id["xc-5"]["status"] == "source_missing"
+        assert result["counts"]["correct"] == 1
+        assert result["counts"]["wrong_format"] == 1
+        assert result["counts"]["duplicate"] == 1
+        assert result["counts"]["missing"] == 1
+        assert result["counts"]["source_missing"] == 1
+
+    asyncio.run(run())
+
+
+def test_real_audio_clears_stale_last_error():
+    hub = app.SharedStreamHub(Channel(channel_id="xc-9", name="Recovery"), "mp3")
+    hub.last_error = "RuntimeError: old failure"
+    hub._record_chunk(b"abc", real_audio=True)
+    assert hub.last_error == ""
+    assert hub.state == "real_audio"
