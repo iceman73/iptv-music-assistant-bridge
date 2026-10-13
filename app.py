@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.1")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.2")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -659,6 +659,7 @@ class SharedStreamHub:
         self.current_attempt_started_at = utc_now_iso()
         self.current_attempt_http_503_count = 0
         self.current_attempt_http_error_count = 0
+        self.last_error = ""
         self.last_chunk_at = ""
         self.last_real_chunk_at = ""
         self._last_chunk_monotonic = 0.0
@@ -770,6 +771,7 @@ class SharedStreamHub:
         if real_audio:
             self.state = "real_audio"
             self.waiting_for_upstream_slot = False
+            self.last_error = ""
             self.real_audio_bytes += size
             self.real_audio_chunks += 1
             self.last_real_chunk_at = now_iso
@@ -1268,6 +1270,93 @@ class MusicAssistantSyncService:
                 break
             offset += limit
         return managed
+
+    async def audit_library_radios(self, channels: list[Channel]) -> dict[str, Any]:
+        """Compare bridge-managed MA radios with the current bridge catalog."""
+        if IMPORT_FORMAT not in {"aac", "mp3"}:
+            raise RuntimeError("IMPORT_FORMAT must be aac or mp3")
+        managed = await self._managed_library_radios()
+        desired_by_id = {channel.channel_id: channel for channel in channels}
+        existing_by_id: dict[str, list[dict[str, Any]]] = {}
+        unparsed: list[dict[str, Any]] = []
+
+        for item in managed:
+            url = self._managed_url_from_item(item)
+            channel_id = self._managed_channel_id_from_url(url)
+            if channel_id:
+                existing_by_id.setdefault(channel_id, []).append(item)
+            else:
+                unparsed.append({
+                    "name": _existing_radio_name(item),
+                    "item_id": str(item.get("item_id") or ""),
+                    "ma_url": url,
+                    "status": "unparsed_managed_url",
+                })
+
+        rows: list[dict[str, Any]] = []
+        counts = {
+            "correct": 0,
+            "wrong_format": 0,
+            "duplicate": 0,
+            "missing": 0,
+            "source_missing": 0,
+            "unparsed_managed_url": len(unparsed),
+        }
+
+        for channel_id, channel in desired_by_id.items():
+            desired_url = channel.bridge_url(IMPORT_FORMAT)
+            items = existing_by_id.get(channel_id, [])
+            urls = [self._managed_url_from_item(item) for item in items]
+            exact = [item for item in items if self._managed_url_from_item(item) == desired_url]
+            stale = [item for item in items if self._managed_url_from_item(item) != desired_url]
+
+            if not items:
+                status = "missing"
+            elif len(items) > 1:
+                status = "duplicate"
+            elif exact:
+                status = "correct"
+            else:
+                status = "wrong_format"
+
+            counts[status] += 1
+            rows.append({
+                "channel_id": channel_id,
+                "name": channel.name,
+                "desired_format": IMPORT_FORMAT,
+                "desired_url": desired_url,
+                "ma_urls": urls,
+                "ma_item_ids": [str(item.get("item_id") or "") for item in items],
+                "stale_urls": [self._managed_url_from_item(item) for item in stale],
+                "status": status,
+            })
+
+        for channel_id, items in existing_by_id.items():
+            if channel_id in desired_by_id:
+                continue
+            counts["source_missing"] += 1
+            rows.append({
+                "channel_id": channel_id,
+                "name": _existing_radio_name(items[0]) if items else "",
+                "desired_format": IMPORT_FORMAT,
+                "desired_url": "",
+                "ma_urls": [self._managed_url_from_item(item) for item in items],
+                "ma_item_ids": [str(item.get("item_id") or "") for item in items],
+                "stale_urls": [self._managed_url_from_item(item) for item in items],
+                "status": "source_missing",
+            })
+
+        rows.extend(unparsed)
+        rows.sort(key=lambda row: (str(row.get("status", "")), str(row.get("name", "")).casefold()))
+        return {
+            "configured": bool(MUSIC_ASSISTANT_URL and MUSIC_ASSISTANT_TOKEN),
+            "format": IMPORT_FORMAT,
+            "managed_url_prefix": MA_MANAGED_URL_PREFIX,
+            "desired_count": len(desired_by_id),
+            "managed_count": len(managed),
+            "counts": counts,
+            "radios": rows,
+        }
 
     async def _add_radio_with_warm_source(self, channel: Channel, args: dict[str, Any]) -> None:
         """Warm the source, keep it open through every MA add retry, then close it."""
@@ -1823,7 +1912,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.1"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.2"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -1902,7 +1991,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.1", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.2", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2442,7 +2531,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.1",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.2",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
@@ -2550,6 +2639,17 @@ async def refresh_catalog():
 @app.get("/ma/status")
 async def ma_sync_status():
     return ma_sync_service.status()
+
+
+@app.get("/ma/radios")
+async def ma_radio_audit():
+    if not MUSIC_ASSISTANT_TOKEN:
+        raise HTTPException(status_code=400, detail="MUSIC_ASSISTANT_TOKEN is empty")
+    channels = await catalog.refresh()
+    try:
+        return await ma_sync_service.audit_library_radios(channels)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/ma/sync")
