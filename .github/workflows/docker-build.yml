@@ -4,13 +4,15 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*.*.*"
   pull_request:
     branches:
       - main
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -38,6 +40,30 @@ jobs:
         timeout-minutes: 5
         run: pytest -vv -x
 
+      - name: Verify release tag matches bridge version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          text = pathlib.Path("app.py").read_text(encoding="utf-8")
+          match = re.search(r'DISPATCHARR_USER_AGENT\s*=.*?Dispatcharr-MA-Bridge/([0-9]+\.[0-9]+\.[0-9]+)', text)
+          if not match:
+              raise SystemExit("Could not determine bridge version from app.py")
+
+          app_version = match.group(1)
+          tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          if app_version != tag_version:
+              raise SystemExit(
+                  f"Release tag v{tag_version} does not match app version {app_version}"
+              )
+
+          print(f"Validated release version {app_version}")
+          PY
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -49,6 +75,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/iceman73/iptv-music-assistant-bridge
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
       - name: Build and publish image
         uses: docker/build-push-action@v7
         with:
@@ -57,12 +95,21 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             BASE_IMAGE=mirror.gcr.io/library/python:3.12-slim
-          tags: |
-            ghcr.io/iceman73/iptv-music-assistant-bridge:latest
-            ghcr.io/iceman73/iptv-music-assistant-bridge:sha-${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: |
+            ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=https://github.com/iceman73/iptv-music-assistant-bridge
             org.opencontainers.image.description=IPTV audio bridge for Music Assistant with Amazon Echo compatibility
             org.opencontainers.image.licenses=Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
