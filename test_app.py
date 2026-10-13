@@ -266,6 +266,12 @@ def test_ma_add_retries_while_same_shared_stream_is_pinned():
         calls = {"count": 0}
 
         class FakeManager:
+            def __init__(self):
+                self.playback_active_event = asyncio.Event()
+
+            async def wait_for_playback_idle(self):
+                return None
+
             @app.asynccontextmanager
             async def hold_warm(self, channel, fmt):
                 events.append("warm-open")
@@ -537,7 +543,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.3"
+    assert row["version"] == "5.6.4"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -840,3 +846,83 @@ def test_remove_all_managed_radios_dry_run_and_execute():
             app.MA_MANAGED_URL_PREFIX = old_prefix
 
     asyncio.run(run())
+
+
+def test_stream_manager_marks_playback_and_demand_type():
+    async def run():
+        manager = app.StreamManager()
+        channel = Channel(channel_id="xc-priority", name="Priority")
+        hub = await manager._hub(channel, "mp3")
+
+        async def fake_subscribe():
+            yield b"audio"
+
+        original = hub.subscribe
+        hub.subscribe = fake_subscribe
+        try:
+            gen = manager.subscribe(channel, "mp3")
+            first = await anext(gen)
+            assert first == b"audio"
+            assert manager.playback_active_event.is_set()
+            assert manager.playback_listeners == 1
+            await gen.aclose()
+            assert not manager.playback_active_event.is_set()
+            assert manager.playback_idle_event.is_set()
+            assert manager.playback_listeners == 0
+        finally:
+            hub.subscribe = original
+
+    asyncio.run(run())
+
+
+def test_warmup_is_preempted_while_playback_active():
+    async def run():
+        manager = app.StreamManager()
+        channel = Channel(channel_id="xc-warm", name="Warm")
+        hub = await manager._hub(channel, "mp3")
+        events = []
+
+        async def fake_pin():
+            hub.pins += 1
+            events.append("pin")
+
+        async def fake_unpin(stop_if_unready=False, stop_if_idle=False):
+            hub.pins = max(0, hub.pins - 1)
+            events.append("unpin")
+
+        original_pin = hub.pin
+        original_unpin = hub.unpin
+        hub.pin = fake_pin
+        hub.unpin = fake_unpin
+
+        manager.playback_active_event.set()
+        manager.playback_idle_event.clear()
+
+        async def release_playback():
+            await asyncio.sleep(0.01)
+            manager.playback_active_event.clear()
+            manager.playback_idle_event.set()
+
+        release_task = asyncio.create_task(release_playback())
+        old_warmup = app.STREAM_WARMUP_ENABLED
+        try:
+            app.STREAM_WARMUP_ENABLED = False
+            async with manager.hold_warm(channel, "mp3"):
+                events.append("yield")
+            await release_task
+            assert events == ["pin", "yield", "unpin"]
+        finally:
+            app.STREAM_WARMUP_ENABLED = old_warmup
+            hub.pin = original_pin
+            hub.unpin = original_unpin
+
+    asyncio.run(run())
+
+
+def test_hub_status_reports_demand_type():
+    hub = app.SharedStreamHub(Channel(channel_id="xc-demand", name="Demand"), "mp3")
+    assert hub.status()["demand_type"] == "linger"
+    hub.pins = 1
+    assert hub.status()["demand_type"] == "ma_warmup"
+    hub.subscribers["x"] = asyncio.Queue()
+    assert hub.status()["demand_type"] == "playback"
