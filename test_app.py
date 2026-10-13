@@ -421,6 +421,7 @@ def test_v5_real_audio_stall_does_not_kill_ffmpeg_generator():
         old_audio = app.ffmpeg_audio_stream
         old_enabled = app.STARTUP_SILENCE_ENABLED
         old_stall = app.REAL_AUDIO_STALL_SECONDS
+        old_gap_enabled = app.POST_START_GAP_FILL_ENABLED
 
         async def fake_silence(fmt):
             while True:
@@ -437,6 +438,7 @@ def test_v5_real_audio_stall_does_not_kill_ffmpeg_generator():
             app.ffmpeg_audio_stream = fake_audio
             app.STARTUP_SILENCE_ENABLED = True
             app.REAL_AUDIO_STALL_SECONDS = 0.01
+            app.POST_START_GAP_FILL_ENABLED = False
             ch = Channel(channel_id="xc-stall", name="Stall Test", source_url="http://example.test/live.ts")
             gen = app.startup_protected_audio_stream(ch, "aac")
             chunks = []
@@ -451,6 +453,7 @@ def test_v5_real_audio_stall_does_not_kill_ffmpeg_generator():
             app.ffmpeg_audio_stream = old_audio
             app.STARTUP_SILENCE_ENABLED = old_enabled
             app.REAL_AUDIO_STALL_SECONDS = old_stall
+            app.POST_START_GAP_FILL_ENABLED = old_gap_enabled
     asyncio.run(run())
 
 
@@ -1052,6 +1055,7 @@ def test_post_start_gap_fill_keeps_stream_continuous():
             yield b"R1"
             await asyncio.sleep(0.03)
             yield b"R2"
+            return
 
         try:
             app.ffmpeg_silence_stream = fake_silence
@@ -1069,10 +1073,15 @@ def test_post_start_gap_fill_keeps_stream_continuous():
             )
             chunks = []
             try:
-                while True:
-                    chunks.append(await asyncio.wait_for(anext(gen), timeout=0.5))
-            except StopAsyncIteration:
-                pass
+                for _ in range(50):
+                    chunk = await asyncio.wait_for(anext(gen), timeout=0.2)
+                    chunks.append(chunk)
+                    if chunk == b"R2":
+                        break
+                else:
+                    raise AssertionError("R2 never arrived during bounded gap-fill test")
+            finally:
+                await asyncio.wait_for(gen.aclose(), timeout=0.5)
 
             assert b"R1" in chunks and b"R2" in chunks
             between = chunks[chunks.index(b"R1") + 1:chunks.index(b"R2")]
@@ -1087,8 +1096,7 @@ def test_post_start_gap_fill_keeps_stream_continuous():
             app.POST_START_GAP_FILL_ENABLED = old_gap_enabled
             app.POST_START_GAP_FILL_AFTER_SECONDS = old_gap_after
 
-    asyncio.run(run())
-
+    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
 
 def test_mp3_streams_disable_midstream_headers_for_clean_splicing():
     ch = Channel(channel_id="xc-mp3", name="MP3", source_url="http://example.test/live.ts")
@@ -1132,4 +1140,4 @@ def test_channel_switch_preempts_old_linger_hub():
                 except asyncio.CancelledError:
                     pass
 
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
