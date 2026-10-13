@@ -926,3 +926,43 @@ def test_hub_status_reports_demand_type():
     assert hub.status()["demand_type"] == "ma_warmup"
     hub.subscribers["x"] = asyncio.Queue()
     assert hub.status()["demand_type"] == "playback"
+
+
+def test_playback_preempts_unrelated_warmup_hub():
+    async def run():
+        manager = app.StreamManager()
+        warm_channel = Channel(channel_id="xc-warm2", name="Warm 2")
+        play_channel = Channel(channel_id="xc-play2", name="Play 2")
+        warm_hub = await manager._hub(warm_channel, "mp3")
+        play_hub = await manager._hub(play_channel, "mp3")
+
+        warm_hub.pins = 1
+
+        async def sleeper():
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(sleeper())
+        warm_hub.task = task
+
+        async def fake_play_subscribe():
+            yield b"audio"
+
+        original = play_hub.subscribe
+        play_hub.subscribe = fake_play_subscribe
+        try:
+            gen = manager.subscribe(play_channel, "mp3")
+            assert await anext(gen) == b"audio"
+            await asyncio.sleep(0)
+            assert task.done()
+            assert manager.ma_warmups_preempted == 1
+            await gen.aclose()
+        finally:
+            play_hub.subscribe = original
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    asyncio.run(run())
