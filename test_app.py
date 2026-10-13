@@ -543,7 +543,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.6"
+    assert row["version"] == "5.6.7"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -1095,3 +1095,41 @@ def test_mp3_streams_disable_midstream_headers_for_clean_splicing():
     cmd = app.build_ffmpeg_command(ch, "mp3")
     assert "-write_xing" in cmd and cmd[cmd.index("-write_xing") + 1] == "0"
     assert "-id3v2_version" in cmd and cmd[cmd.index("-id3v2_version") + 1] == "0"
+
+
+def test_channel_switch_preempts_old_linger_hub():
+    async def run():
+        manager = app.StreamManager()
+        old_channel = Channel(channel_id="xc-old", name="Old")
+        new_channel = Channel(channel_id="xc-new", name="New")
+        old_hub = await manager._hub(old_channel, "mp3")
+        new_hub = await manager._hub(new_channel, "mp3")
+
+        async def sleeper():
+            await asyncio.sleep(60)
+
+        old_task = asyncio.create_task(sleeper())
+        old_hub.task = old_task
+
+        async def fake_new_subscribe():
+            yield b"audio"
+
+        original = new_hub.subscribe
+        new_hub.subscribe = fake_new_subscribe
+        try:
+            gen = manager.subscribe(new_channel, "mp3")
+            assert await anext(gen) == b"audio"
+            await asyncio.sleep(0)
+            assert old_task.done()
+            assert manager.linger_hubs_preempted == 1
+            await gen.aclose()
+        finally:
+            new_hub.subscribe = original
+            if not old_task.done():
+                old_task.cancel()
+                try:
+                    await old_task
+                except asyncio.CancelledError:
+                    pass
+
+    asyncio.run(run())
