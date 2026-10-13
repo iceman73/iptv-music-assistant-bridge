@@ -543,7 +543,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.5"
+    assert row["version"] == "5.6.6"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -1030,3 +1030,68 @@ def test_bitrate_parser():
     assert app._bitrate_to_bps("128000") == 128000
     assert app._bitrate_to_bps("1.5m") == 1500000
     assert app._bitrate_to_bps("bad") == 0
+
+
+def test_post_start_gap_fill_keeps_stream_continuous():
+    async def run():
+        old_silence = app.ffmpeg_silence_stream
+        old_audio = app.ffmpeg_audio_stream
+        old_enabled = app.STARTUP_SILENCE_ENABLED
+        old_gap_enabled = app.POST_START_GAP_FILL_ENABLED
+        old_gap_after = app.POST_START_GAP_FILL_AFTER_SECONDS
+
+        events = []
+        kinds = []
+
+        async def fake_silence(fmt):
+            while True:
+                await asyncio.sleep(0.002)
+                yield b"S"
+
+        async def fake_audio(channel, fmt, force_transcode=False, diagnostic_callback=None):
+            yield b"R1"
+            await asyncio.sleep(0.03)
+            yield b"R2"
+
+        try:
+            app.ffmpeg_silence_stream = fake_silence
+            app.ffmpeg_audio_stream = fake_audio
+            app.STARTUP_SILENCE_ENABLED = True
+            app.POST_START_GAP_FILL_ENABLED = True
+            app.POST_START_GAP_FILL_AFTER_SECONDS = 0.01
+
+            ch = Channel(channel_id="xc-gap", name="Gap Test", source_url="http://example.test/live.ts")
+            gen = app.startup_protected_audio_stream(
+                ch,
+                "mp3",
+                diagnostic_callback=events.append,
+                output_kind_callback=kinds.append,
+            )
+            chunks = []
+            try:
+                while True:
+                    chunks.append(await asyncio.wait_for(anext(gen), timeout=0.5))
+            except StopAsyncIteration:
+                pass
+
+            assert b"R1" in chunks and b"R2" in chunks
+            between = chunks[chunks.index(b"R1") + 1:chunks.index(b"R2")]
+            assert b"S" in between
+            assert "gap_fill_start" in events
+            assert "gap_fill_end" in events
+            assert False in kinds and True in kinds
+        finally:
+            app.ffmpeg_silence_stream = old_silence
+            app.ffmpeg_audio_stream = old_audio
+            app.STARTUP_SILENCE_ENABLED = old_enabled
+            app.POST_START_GAP_FILL_ENABLED = old_gap_enabled
+            app.POST_START_GAP_FILL_AFTER_SECONDS = old_gap_after
+
+    asyncio.run(run())
+
+
+def test_mp3_streams_disable_midstream_headers_for_clean_splicing():
+    ch = Channel(channel_id="xc-mp3", name="MP3", source_url="http://example.test/live.ts")
+    cmd = app.build_ffmpeg_command(ch, "mp3")
+    assert "-write_xing" in cmd and cmd[cmd.index("-write_xing") + 1] == "0"
+    assert "-id3v2_version" in cmd and cmd[cmd.index("-id3v2_version") + 1] == "0"
