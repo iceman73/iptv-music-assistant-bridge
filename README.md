@@ -81,19 +81,40 @@ Old variables left in an existing local `.env` are harmless, but they are ignore
 
 The recommended Dispatcharr source is audio-only AAC-LC, 128 kbps, 48 kHz, stereo in MPEG-TS.
 
-## Published image
+## Published images and releases
 
-Successful builds from `main` publish:
+Normal builds from `main` publish:
 
 ```text
 ghcr.io/iceman73/iptv-music-assistant-bridge:latest
-```
-
-Each build also receives:
-
-```text
 ghcr.io/iceman73/iptv-music-assistant-bridge:sha-<git-commit>
 ```
+
+Formal releases use a semantic Git tag such as `v6.0.0`. A successful tagged build publishes:
+
+```text
+ghcr.io/iceman73/iptv-music-assistant-bridge:6.0.0
+ghcr.io/iceman73/iptv-music-assistant-bridge:6.0
+ghcr.io/iceman73/iptv-music-assistant-bridge:6
+ghcr.io/iceman73/iptv-music-assistant-bridge:latest
+ghcr.io/iceman73/iptv-music-assistant-bridge:sha-<git-commit>
+```
+
+The tagged workflow also creates the matching GitHub Release with generated release notes. The release tag must match the version declared in `app.py`; the workflow fails rather than publishing a mismatched version.
+
+Use semantic versioning from v6 forward:
+
+- patch release: `6.0.1` for fixes
+- minor release: `6.1.0` for backward-compatible features
+- major release: `7.0.0` for breaking or architectural changes
+
+For reproducible deployments, pin the full release tag:
+
+```yaml
+image: ghcr.io/iceman73/iptv-music-assistant-bridge:6.0.0
+```
+
+Use `latest` only when you intentionally want the newest successful main/release build.
 
 ## Install
 
