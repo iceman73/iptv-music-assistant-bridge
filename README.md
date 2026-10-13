@@ -335,9 +335,9 @@ After a Music Assistant add/update finishes its release-grace window, a listener
 
 ### v5.6.4 playback priority
 
-Live stream listeners now take priority over Music Assistant catalog warmups. The bridge will not start a new MA warmup while any stream listener is active. If playback begins while an unrelated MA warmup is still waiting for real audio, that warmup is released immediately and resumes after playback becomes idle. The MA release-grace period also ends early when playback becomes active.
+Live stream listeners now take priority over Music Assistant catalog warmups. The bridge will not start a new MA warmup while any stream listener is active. If playback begins while an unrelated MA warmup owns an upstream slot, that warmup's FFmpeg process is cancelled immediately, its pin is released, and the import resumes after playback becomes idle. The MA release-grace period also ends early when playback becomes active.
 
-`/streams` now reports `playback_priority_active`, `playback_listeners`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
+`/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
 
 ### v5.4 stream write smoothing
 
