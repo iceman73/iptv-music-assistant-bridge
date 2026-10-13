@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.7")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.8")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -108,8 +108,14 @@ STARTUP_SILENCE_ENABLED = os.getenv("STARTUP_SILENCE_ENABLED", "true").strip().l
 STARTUP_SILENCE_MAX_SECONDS = max(5.0, float(os.getenv("STARTUP_SILENCE_MAX_SECONDS", "60")))
 STARTUP_REAL_AUDIO_RETRIES = max(1, int(os.getenv("STARTUP_REAL_AUDIO_RETRIES", "3")))
 STARTUP_REAL_AUDIO_RETRY_DELAY = max(0.0, float(os.getenv("STARTUP_REAL_AUDIO_RETRY_DELAY", "2")))
-POST_START_GAP_FILL_ENABLED = os.getenv("POST_START_GAP_FILL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+POST_START_GAP_FILL_ENABLED = os.getenv("POST_START_GAP_FILL_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 POST_START_GAP_FILL_AFTER_SECONDS = max(0.25, float(os.getenv("POST_START_GAP_FILL_AFTER_SECONDS", "0.75")))
+STREAM_JITTER_BUFFER_ENABLED = os.getenv("STREAM_JITTER_BUFFER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+STREAM_JITTER_BUFFER_SECONDS = max(0.0, float(os.getenv("STREAM_JITTER_BUFFER_SECONDS", "2.0")))
+STREAM_JITTER_BUFFER_MAX_SECONDS = max(
+    STREAM_JITTER_BUFFER_SECONDS,
+    float(os.getenv("STREAM_JITTER_BUFFER_MAX_SECONDS", "8.0")),
+)
 
 # Shared per-channel stream sessions. Music Assistant may briefly disconnect/reopen
 # a Radio URL while probing or handing playback to a player. Keep one upstream
@@ -567,6 +573,116 @@ def _bitrate_to_bps(value: str) -> int:
     return max(0, int(number * multiplier))
 
 
+async def jitter_buffer_encoded_audio(
+    source: AsyncIterator[tuple[bytes, bool]],
+    fmt: str,
+    status_callback=None,
+) -> AsyncIterator[tuple[bytes, bool]]:
+    """Read encoded MP3 ahead of playback to absorb bursty upstream delivery.
+
+    A producer drains FFmpeg as data arrives while the consumer feeds the
+    existing realtime pacing stage. Startup silence passes through immediately.
+    Real playback begins after the configured reserve is available. If that
+    reserve is fully exhausted, playback re-primes rather than repeatedly
+    starting and stopping on tiny bursts.
+    """
+    if not STREAM_JITTER_BUFFER_ENABLED or fmt != "mp3" or STREAM_JITTER_BUFFER_SECONDS <= 0:
+        async for item in source:
+            yield item
+        return
+
+    bitrate_bps = _bitrate_to_bps(MP3_BITRATE)
+    if bitrate_bps <= 0:
+        async for item in source:
+            yield item
+        return
+
+    bytes_per_second = bitrate_bps / 8.0
+    target_bytes = max(1, int(bytes_per_second * STREAM_JITTER_BUFFER_SECONDS))
+    max_bytes = max(target_bytes, int(bytes_per_second * STREAM_JITTER_BUFFER_MAX_SECONDS))
+
+    buffer: deque[tuple[bytes, bool]] = deque()
+    buffered_real_bytes = 0
+    condition = asyncio.Condition()
+    producer_done = False
+    producer_error: BaseException | None = None
+    primed = False
+    seen_real = False
+
+    def report(event: str, value: float = 0.0) -> None:
+        if status_callback is not None:
+            status_callback(event, value)
+
+    async def producer() -> None:
+        nonlocal buffered_real_bytes, producer_done, producer_error
+        try:
+            async for chunk, real_audio in source:
+                if not chunk:
+                    continue
+                async with condition:
+                    while real_audio and buffered_real_bytes >= max_bytes:
+                        await condition.wait()
+                    buffer.append((chunk, real_audio))
+                    if real_audio:
+                        buffered_real_bytes += len(chunk)
+                    report("level", buffered_real_bytes / bytes_per_second)
+                    condition.notify_all()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            producer_error = exc
+        finally:
+            async with condition:
+                producer_done = True
+                condition.notify_all()
+
+    producer_task = asyncio.create_task(producer(), name="mp3-jitter-producer")
+    try:
+        while True:
+            async with condition:
+                while not buffer and not producer_done:
+                    await condition.wait()
+                if not buffer and producer_done:
+                    if producer_error is not None:
+                        raise producer_error
+                    return
+
+                _, head_real = buffer[0]
+
+                # Startup silence is already realtime encoded and should not wait
+                # behind the real-audio reserve.
+                if not head_real and not seen_real:
+                    chunk, real_audio = buffer.popleft()
+                    condition.notify_all()
+                else:
+                    seen_real = True
+                    if not primed:
+                        while buffered_real_bytes < target_bytes and not producer_done:
+                            await condition.wait()
+                        primed = True
+                        report("primed", buffered_real_bytes / bytes_per_second)
+
+                    if not buffer:
+                        continue
+                    chunk, real_audio = buffer.popleft()
+                    if real_audio:
+                        buffered_real_bytes = max(0, buffered_real_bytes - len(chunk))
+                    report("level", buffered_real_bytes / bytes_per_second)
+                    condition.notify_all()
+
+            yield chunk, real_audio
+
+            if real_audio:
+                async with condition:
+                    if not buffer and not producer_done:
+                        primed = False
+                        report("underrun", 0.0)
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
+        await asyncio.gather(producer_task, return_exceptions=True)
+
+
 async def pace_encoded_audio(
     source: AsyncIterator[tuple[bytes, bool]],
     fmt: str,
@@ -707,6 +823,10 @@ class SharedStreamHub:
         self.gap_fill_events = 0
         self.gap_fill_seconds = 0.0
         self._gap_fill_started_monotonic = 0.0
+        self.jitter_buffer_seconds = 0.0
+        self.jitter_buffer_max_observed_seconds = 0.0
+        self.jitter_buffer_primed = False
+        self.jitter_buffer_underruns = 0
         self.current_attempt_http_503_count = 0
         self.current_attempt_http_error_count = 0
         self.current_attempt_number = 0
@@ -766,6 +886,26 @@ class SharedStreamHub:
                     self.gap_fill_seconds += max(0.0, time.monotonic() - self._gap_fill_started_monotonic)
                 self.gap_fill_active = False
                 self._gap_fill_started_monotonic = 0.0
+
+
+    def record_jitter_event(self, event: str, value: float = 0.0) -> None:
+        if event == "level":
+            self.jitter_buffer_seconds = max(0.0, float(value))
+            self.jitter_buffer_max_observed_seconds = max(
+                self.jitter_buffer_max_observed_seconds,
+                self.jitter_buffer_seconds,
+            )
+        elif event == "primed":
+            self.jitter_buffer_primed = True
+            self.jitter_buffer_seconds = max(0.0, float(value))
+            self.jitter_buffer_max_observed_seconds = max(
+                self.jitter_buffer_max_observed_seconds,
+                self.jitter_buffer_seconds,
+            )
+        elif event == "underrun":
+            self.jitter_buffer_primed = False
+            self.jitter_buffer_seconds = 0.0
+            self.jitter_buffer_underruns += 1
 
 
     def _cancel_linger_locked(self) -> None:
@@ -906,7 +1046,12 @@ class SharedStreamHub:
                             yield chunk, real_audio
 
                     coalesced = coalesce_audio_chunks(tagged_stream())
-                    async for chunk, real_audio in pace_encoded_audio(coalesced, self.fmt):
+                    jittered = jitter_buffer_encoded_audio(
+                        coalesced,
+                        self.fmt,
+                        status_callback=self.record_jitter_event,
+                    )
+                    async for chunk, real_audio in pace_encoded_audio(jittered, self.fmt):
                         await self._broadcast(chunk, real_audio=real_audio)
                     self.last_error = "upstream stream ended"
                 except asyncio.CancelledError:
@@ -1131,6 +1276,13 @@ class SharedStreamHub:
             "output_pacing_enabled": bool(STREAM_OUTPUT_PACING and self.fmt == "mp3"),
             "output_pacing_target_kbps": round(_bitrate_to_bps(MP3_BITRATE) / 1000, 1) if self.fmt == "mp3" else None,
             "output_pacing_slack_seconds": STREAM_OUTPUT_PACING_SLACK_SECONDS,
+            "jitter_buffer_enabled": bool(STREAM_JITTER_BUFFER_ENABLED and self.fmt == "mp3"),
+            "jitter_buffer_target_seconds": STREAM_JITTER_BUFFER_SECONDS,
+            "jitter_buffer_max_seconds": STREAM_JITTER_BUFFER_MAX_SECONDS,
+            "jitter_buffer_current_seconds": round(self.jitter_buffer_seconds, 3),
+            "jitter_buffer_max_observed_seconds": round(self.jitter_buffer_max_observed_seconds, 3),
+            "jitter_buffer_primed": self.jitter_buffer_primed,
+            "jitter_buffer_underruns": self.jitter_buffer_underruns,
             "ring_buffer_seconds": STREAM_RING_BUFFER_SECONDS,
             "ring_buffer_chunks": len(self._ring_buffer),
             "upstream_http_503_count": self.upstream_http_503_count,
@@ -2213,7 +2365,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.7"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.8"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -2292,7 +2444,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.7", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.8", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2937,7 +3089,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.7",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.8",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
