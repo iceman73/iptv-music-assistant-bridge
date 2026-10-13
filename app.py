@@ -1,3 +1,4 @@
+import json
 import asyncio
 import logging
 import os
@@ -39,7 +40,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.9")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.10")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -112,15 +113,23 @@ POST_START_GAP_FILL_ENABLED = os.getenv("POST_START_GAP_FILL_ENABLED", "false").
 POST_START_GAP_FILL_AFTER_SECONDS = max(0.25, float(os.getenv("POST_START_GAP_FILL_AFTER_SECONDS", "0.75")))
 STREAM_JITTER_BUFFER_ENABLED = os.getenv("STREAM_JITTER_BUFFER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 STREAM_JITTER_BUFFER_ADAPTIVE = os.getenv("STREAM_JITTER_BUFFER_ADAPTIVE", "true").strip().lower() in {"1", "true", "yes", "on"}
-STREAM_JITTER_BUFFER_SECONDS = max(0.0, float(os.getenv("STREAM_JITTER_BUFFER_SECONDS", "4.0")))
-STREAM_JITTER_BUFFER_MIN_SECONDS = max(0.0, float(os.getenv("STREAM_JITTER_BUFFER_MIN_SECONDS", "2.0")))
+STREAM_JITTER_BUFFER_SECONDS = max(0.0, float(os.getenv("STREAM_JITTER_BUFFER_SECONDS", "8.0")))
+STREAM_JITTER_BUFFER_MIN_SECONDS = max(0.0, float(os.getenv("STREAM_JITTER_BUFFER_MIN_SECONDS", "4.0")))
 STREAM_JITTER_BUFFER_MAX_SECONDS = max(
     STREAM_JITTER_BUFFER_SECONDS,
-    float(os.getenv("STREAM_JITTER_BUFFER_MAX_SECONDS", "16.0")),
+    float(os.getenv("STREAM_JITTER_BUFFER_MAX_SECONDS", "20.0")),
+)
+STREAM_JITTER_BUFFER_LOW_WATER_SECONDS = max(
+    0.25,
+    min(
+        STREAM_JITTER_BUFFER_MAX_SECONDS,
+        float(os.getenv("STREAM_JITTER_BUFFER_LOW_WATER_SECONDS", "2.0")),
+    ),
 )
 STREAM_JITTER_BUFFER_INCREASE_SECONDS = max(0.25, float(os.getenv("STREAM_JITTER_BUFFER_INCREASE_SECONDS", "2.0")))
 STREAM_JITTER_BUFFER_DECREASE_SECONDS = max(0.25, float(os.getenv("STREAM_JITTER_BUFFER_DECREASE_SECONDS", "1.0")))
-STREAM_JITTER_BUFFER_STABLE_SECONDS = max(30.0, float(os.getenv("STREAM_JITTER_BUFFER_STABLE_SECONDS", "600")))
+STREAM_JITTER_BUFFER_STABLE_SECONDS = max(30.0, float(os.getenv("STREAM_JITTER_BUFFER_STABLE_SECONDS", "900")))
+STREAM_JITTER_STATE_FILE = os.getenv("STREAM_JITTER_STATE_FILE", "/data/jitter-targets.json").strip()
 
 # Shared per-channel stream sessions. Music Assistant may briefly disconnect/reopen
 # a Radio URL while probing or handing playback to a player. Keep one upstream
@@ -192,6 +201,75 @@ def exception_detail(exc: BaseException) -> str:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _load_jitter_targets() -> dict[str, float]:
+    if not STREAM_JITTER_STATE_FILE:
+        return {}
+    try:
+        path = Path(STREAM_JITTER_STATE_FILE)
+        if not path.exists():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("targets", {}) if isinstance(payload, dict) else {}
+        result: dict[str, float] = {}
+        for key, value in rows.items():
+            try:
+                target = float(value)
+            except (TypeError, ValueError):
+                continue
+            result[str(key)] = min(
+                STREAM_JITTER_BUFFER_MAX_SECONDS,
+                max(STREAM_JITTER_BUFFER_MIN_SECONDS, target),
+            )
+        if result:
+            LOGGER.info("Loaded %d learned jitter target(s) from %s", len(result), path)
+        return result
+    except Exception as exc:
+        LOGGER.warning("Could not load learned jitter targets: %s", redact_secrets(exc))
+        return {}
+
+
+def _save_jitter_targets() -> None:
+    if not STREAM_JITTER_STATE_FILE:
+        return
+    try:
+        path = Path(STREAM_JITTER_STATE_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"saved_at": utc_now_iso(), "targets": _jitter_learned_targets}, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except Exception as exc:
+        LOGGER.warning("Could not save learned jitter targets: %s", redact_secrets(exc))
+
+
+def _learned_jitter_target(key: str) -> float:
+    configured = min(
+        STREAM_JITTER_BUFFER_MAX_SECONDS,
+        max(STREAM_JITTER_BUFFER_MIN_SECONDS, STREAM_JITTER_BUFFER_SECONDS),
+    )
+    return min(
+        STREAM_JITTER_BUFFER_MAX_SECONDS,
+        max(STREAM_JITTER_BUFFER_MIN_SECONDS, _jitter_learned_targets.get(key, configured)),
+    )
+
+
+def _remember_jitter_target(key: str, target: float) -> None:
+    bounded = min(
+        STREAM_JITTER_BUFFER_MAX_SECONDS,
+        max(STREAM_JITTER_BUFFER_MIN_SECONDS, float(target)),
+    )
+    previous = _jitter_learned_targets.get(key)
+    if previous is not None and abs(previous - bounded) < 0.01:
+        return
+    _jitter_learned_targets[key] = bounded
+    _save_jitter_targets()
+
+
+_jitter_learned_targets: dict[str, float] = _load_jitter_targets()
 
 
 def normalize_name(value: str) -> str:
@@ -584,13 +662,12 @@ async def jitter_buffer_encoded_audio(
     status_callback=None,
     initial_target_seconds: float | None = None,
 ) -> AsyncIterator[tuple[bytes, bool]]:
-    """Read encoded MP3 ahead of playback and adapt reserve per active channel.
+    """Buffer encoded MP3 ahead of playback and learn per-channel reserve needs.
 
-    The producer drains FFmpeg as data arrives while the consumer feeds the
-    existing realtime pacing stage. Startup silence passes through immediately.
-    Real playback starts after the working reserve is available. On a true
-    underrun the working target increases; after a long stable period it
-    decreases gradually toward the configured minimum.
+    A channel starts from its persisted learned target. If the reserve crosses
+    the low-water threshold, the learned target is raised immediately for future
+    tunes/source reacquisitions instead of waiting for an audible underrun.
+    Actual underruns are still counted as Echo corruption-risk events.
     """
     if not STREAM_JITTER_BUFFER_ENABLED or fmt != "mp3" or STREAM_JITTER_BUFFER_SECONDS <= 0:
         async for item in source:
@@ -611,6 +688,7 @@ async def jitter_buffer_encoded_audio(
         STREAM_JITTER_BUFFER_MAX_SECONDS,
     )
     max_bytes = max(1, int(bytes_per_second * STREAM_JITTER_BUFFER_MAX_SECONDS))
+    low_water_bytes = max(1, int(bytes_per_second * STREAM_JITTER_BUFFER_LOW_WATER_SECONDS))
 
     buffer: deque[tuple[bytes, bool]] = deque()
     buffered_real_bytes = 0
@@ -620,6 +698,7 @@ async def jitter_buffer_encoded_audio(
     primed = False
     seen_real = False
     stable_since = time.monotonic()
+    low_water_latched = False
 
     def target_bytes() -> int:
         return max(1, int(bytes_per_second * adaptive_target))
@@ -690,10 +769,32 @@ async def jitter_buffer_encoded_audio(
             if real_audio:
                 now = time.monotonic()
                 async with condition:
+                    # Grow the learned target before the current stream reaches
+                    # zero. Do not pause the active Echo stream here; the larger
+                    # target protects the next tune/reacquisition.
+                    if (
+                        STREAM_JITTER_BUFFER_ADAPTIVE
+                        and buffered_real_bytes <= low_water_bytes
+                        and not low_water_latched
+                    ):
+                        low_water_latched = True
+                        stable_since = now
+                        report("low_water", buffered_real_bytes / bytes_per_second)
+                        if adaptive_target < STREAM_JITTER_BUFFER_MAX_SECONDS:
+                            adaptive_target = min(
+                                STREAM_JITTER_BUFFER_MAX_SECONDS,
+                                adaptive_target + STREAM_JITTER_BUFFER_INCREASE_SECONDS,
+                            )
+                            report("target_increase", adaptive_target)
+                    elif buffered_real_bytes >= target_bytes():
+                        low_water_latched = False
+
                     if not buffer and not producer_done:
                         primed = False
-                        report("underrun", 0.0)
                         stable_since = now
+                        report("underrun", 0.0)
+                        # An underrun is too late for the current Echo session,
+                        # but learn even more reserve for the next clean tune.
                         if STREAM_JITTER_BUFFER_ADAPTIVE and adaptive_target < STREAM_JITTER_BUFFER_MAX_SECONDS:
                             adaptive_target = min(
                                 STREAM_JITTER_BUFFER_MAX_SECONDS,
@@ -702,6 +803,7 @@ async def jitter_buffer_encoded_audio(
                             report("target_increase", adaptive_target)
                     elif (
                         STREAM_JITTER_BUFFER_ADAPTIVE
+                        and not low_water_latched
                         and adaptive_target > min_target
                         and (now - stable_since) >= STREAM_JITTER_BUFFER_STABLE_SECONDS
                     ):
@@ -715,6 +817,7 @@ async def jitter_buffer_encoded_audio(
         if not producer_task.done():
             producer_task.cancel()
         await asyncio.gather(producer_task, return_exceptions=True)
+
 
 async def pace_encoded_audio(
     source: AsyncIterator[tuple[bytes, bool]],
@@ -860,12 +963,11 @@ class SharedStreamHub:
         self.jitter_buffer_max_observed_seconds = 0.0
         self.jitter_buffer_primed = False
         self.jitter_buffer_underruns = 0
-        self.jitter_buffer_adaptive_target_seconds = min(
-            max(STREAM_JITTER_BUFFER_SECONDS, STREAM_JITTER_BUFFER_MIN_SECONDS),
-            STREAM_JITTER_BUFFER_MAX_SECONDS,
-        )
+        self.jitter_buffer_adaptive_target_seconds = _learned_jitter_target(self.key)
         self.jitter_buffer_target_increases = 0
         self.jitter_buffer_target_decreases = 0
+        self.jitter_buffer_low_water_events = 0
+        self.jitter_buffer_corruption_risk = False
         self.current_attempt_http_503_count = 0
         self.current_attempt_http_error_count = 0
         self.current_attempt_number = 0
@@ -943,16 +1045,21 @@ class SharedStreamHub:
             )
         elif event == "target":
             self.jitter_buffer_adaptive_target_seconds = max(0.0, float(value))
+        elif event == "low_water":
+            self.jitter_buffer_low_water_events += 1
         elif event == "underrun":
             self.jitter_buffer_primed = False
             self.jitter_buffer_seconds = 0.0
             self.jitter_buffer_underruns += 1
+            self.jitter_buffer_corruption_risk = True
         elif event == "target_increase":
             self.jitter_buffer_adaptive_target_seconds = max(0.0, float(value))
             self.jitter_buffer_target_increases += 1
+            _remember_jitter_target(self.key, self.jitter_buffer_adaptive_target_seconds)
         elif event == "target_decrease":
             self.jitter_buffer_adaptive_target_seconds = max(0.0, float(value))
             self.jitter_buffer_target_decreases += 1
+            _remember_jitter_target(self.key, self.jitter_buffer_adaptive_target_seconds)
 
 
     def _cancel_linger_locked(self) -> None:
@@ -1330,8 +1437,12 @@ class SharedStreamHub:
             "jitter_buffer_target_seconds": STREAM_JITTER_BUFFER_SECONDS,
             "jitter_buffer_adaptive_target_seconds": round(self.jitter_buffer_adaptive_target_seconds, 3),
             "jitter_buffer_max_seconds": STREAM_JITTER_BUFFER_MAX_SECONDS,
+            "jitter_buffer_low_water_seconds": STREAM_JITTER_BUFFER_LOW_WATER_SECONDS,
+            "jitter_buffer_low_water_events": self.jitter_buffer_low_water_events,
             "jitter_buffer_target_increases": self.jitter_buffer_target_increases,
             "jitter_buffer_target_decreases": self.jitter_buffer_target_decreases,
+            "jitter_buffer_target_persisted": self.key in _jitter_learned_targets,
+            "jitter_buffer_corruption_risk": self.jitter_buffer_corruption_risk,
             "jitter_buffer_current_seconds": round(self.jitter_buffer_seconds, 3),
             "jitter_buffer_max_observed_seconds": round(self.jitter_buffer_max_observed_seconds, 3),
             "jitter_buffer_primed": self.jitter_buffer_primed,
@@ -2418,7 +2529,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.9"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.10"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -2497,7 +2608,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.9", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.10", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -3142,7 +3253,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.9",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.10",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
