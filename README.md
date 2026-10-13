@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.5**
+Current release: **v5.6.6**
 
 ## Features
 
@@ -29,6 +29,7 @@ Current release: **v5.6.5**
 - Live playback priority over Music Assistant background warmups
 - Real-time MP3 output pacing to smooth burst-delivered sources
 - Shorter reconnect pre-roll to reduce audible repeats
+- Post-start silence gap fill to keep Echo decoder/timing state stable
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
@@ -276,6 +277,8 @@ MA_REMOVE_MISSING=false
 | `STREAM_RING_BUFFER_SECONDS` | `0.5` | Short reconnect pre-roll; reduced to limit audible repeats |
 | `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
 | `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
+| `POST_START_GAP_FILL_ENABLED` | `true` | Continue sending valid encoded silence during post-start source stalls |
+| `POST_START_GAP_FILL_AFTER_SECONDS` | `0.75` | Start gap fill after this long without real source audio |
 | `FFMPEG_LOG_LEVEL` | `warning` | FFmpeg log verbosity |
 
 ### Catalog and filtering
@@ -347,6 +350,14 @@ After a Music Assistant add/update finishes its release-grace window, a listener
 Live stream listeners now take priority over Music Assistant catalog warmups. The bridge will not start a new MA warmup while any stream listener is active. If playback begins while an unrelated MA warmup owns an upstream slot, that warmup's FFmpeg process is cancelled immediately, its pin is released, and the import resumes after playback becomes idle. The MA release-grace period also ends early when playback becomes active.
 
 `/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
+
+### v5.6.6 post-start gap fill
+
+Echo playback can remain connected while the IPTV source temporarily stops producing audio, then resume with static or jumpy decoder state. v5.6.6 keeps the same downstream HTTP stream alive with valid realtime encoded silence whenever real audio stalls for more than `POST_START_GAP_FILL_AFTER_SECONDS` (default 0.75 seconds). When source audio resumes, the bridge switches back without restarting the client.
+
+The MP3 muxer also disables Xing and ID3v2 headers so switching between the real encoder and the silence encoder does not insert metadata/header blocks in the middle of an active MP3 stream.
+
+`/streams` now reports `gap_fill_enabled`, `gap_fill_after_seconds`, `gap_fill_active`, `gap_fill_events`, and `gap_fill_seconds`.
 
 ### v5.6.5 MP3 pacing and reconnect smoothing
 
