@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.5")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.6")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -108,6 +108,8 @@ STARTUP_SILENCE_ENABLED = os.getenv("STARTUP_SILENCE_ENABLED", "true").strip().l
 STARTUP_SILENCE_MAX_SECONDS = max(5.0, float(os.getenv("STARTUP_SILENCE_MAX_SECONDS", "60")))
 STARTUP_REAL_AUDIO_RETRIES = max(1, int(os.getenv("STARTUP_REAL_AUDIO_RETRIES", "3")))
 STARTUP_REAL_AUDIO_RETRY_DELAY = max(0.0, float(os.getenv("STARTUP_REAL_AUDIO_RETRY_DELAY", "2")))
+POST_START_GAP_FILL_ENABLED = os.getenv("POST_START_GAP_FILL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+POST_START_GAP_FILL_AFTER_SECONDS = max(0.25, float(os.getenv("POST_START_GAP_FILL_AFTER_SECONDS", "0.75")))
 
 # Shared per-channel stream sessions. Music Assistant may briefly disconnect/reopen
 # a Radio URL while probing or handing playback to a player. Keep one upstream
@@ -701,6 +703,10 @@ class SharedStreamHub:
         self.upstream_http_error_count = 0
         self.recovery_count = 0
         self.silence_fallback_count = 0
+        self.gap_fill_active = False
+        self.gap_fill_events = 0
+        self.gap_fill_seconds = 0.0
+        self._gap_fill_started_monotonic = 0.0
         self.current_attempt_http_503_count = 0
         self.current_attempt_http_error_count = 0
         self.current_attempt_number = 0
@@ -749,6 +755,17 @@ class SharedStreamHub:
             self.recovery_count += 1
         elif event == "silence_fallback":
             self.silence_fallback_count += 1
+        elif event == "gap_fill_start":
+            if not self.gap_fill_active:
+                self.gap_fill_active = True
+                self.gap_fill_events += 1
+                self._gap_fill_started_monotonic = time.monotonic()
+        elif event == "gap_fill_end":
+            if self.gap_fill_active:
+                if self._gap_fill_started_monotonic:
+                    self.gap_fill_seconds += max(0.0, time.monotonic() - self._gap_fill_started_monotonic)
+                self.gap_fill_active = False
+                self._gap_fill_started_monotonic = 0.0
 
 
     def _cancel_linger_locked(self) -> None:
@@ -870,13 +887,20 @@ class SharedStreamHub:
                 self._reset_attempt_diagnostics()
                 try:
                     async def tagged_stream() -> AsyncIterator[tuple[bytes, bool]]:
+                        output_is_real = False
+
+                        def set_output_kind(real_audio: bool) -> None:
+                            nonlocal output_is_real
+                            output_is_real = real_audio
+
                         async for chunk in startup_protected_audio_stream(
                             self.channel,
                             self.fmt,
                             real_audio_event=self.real_audio_ready,
                             diagnostic_callback=self.record_upstream_event,
+                            output_kind_callback=set_output_kind,
                         ):
-                            real_audio = self.real_audio_ready.is_set()
+                            real_audio = output_is_real
                             if real_audio and not self.last_real_audio_at:
                                 self.last_real_audio_at = utc_now_iso()
                             yield chunk, real_audio
@@ -1109,6 +1133,17 @@ class SharedStreamHub:
             "upstream_http_error_count": self.upstream_http_error_count,
             "recovery_count": self.recovery_count,
             "silence_fallback_count": self.silence_fallback_count,
+            "gap_fill_enabled": POST_START_GAP_FILL_ENABLED,
+            "gap_fill_after_seconds": POST_START_GAP_FILL_AFTER_SECONDS,
+            "gap_fill_active": self.gap_fill_active,
+            "gap_fill_events": self.gap_fill_events,
+            "gap_fill_seconds": round(
+                self.gap_fill_seconds + (
+                    time.monotonic() - self._gap_fill_started_monotonic
+                    if self.gap_fill_active and self._gap_fill_started_monotonic else 0.0
+                ),
+                3,
+            ),
             "dropped_chunks": self.dropped_chunks,
             "slow_subscriber_disconnects": self.slow_subscriber_disconnects,
             "restart_count": self.restart_count,
@@ -2171,7 +2206,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.5"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.6"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -2250,7 +2285,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.5", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.6", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2340,7 +2375,8 @@ def build_ffmpeg_command(channel: Channel, fmt: str, source_codec: str = "", for
     if fmt == "mp3":
         return common + [
             "-ac", CHANNELS, "-ar", SAMPLE_RATE,
-            "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", "pipe:1"
+            "-c:a", "libmp3lame", "-b:a", MP3_BITRATE,
+            "-write_xing", "0", "-id3v2_version", "0", "-f", "mp3", "pipe:1"
         ]
     raise ValueError(f"Unsupported format: {fmt}")
 
@@ -2438,7 +2474,8 @@ async def ffmpeg_silence_stream(fmt: str) -> AsyncIterator[bytes]:
     if fmt == "aac":
         cmd = common + ["-c:a", "aac", "-b:a", AAC_BITRATE, "-f", "adts", "pipe:1"]
     else:
-        cmd = common + ["-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", "pipe:1"]
+        cmd = common + ["-c:a", "libmp3lame", "-b:a", MP3_BITRATE,
+            "-write_xing", "0", "-id3v2_version", "0", "-f", "mp3", "pipe:1"]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=256 * 1024
@@ -2490,30 +2527,38 @@ async def startup_protected_audio_stream(
     fmt: str,
     real_audio_event: asyncio.Event | None = None,
     diagnostic_callback=None,
+    output_kind_callback=None,
 ) -> AsyncIterator[bytes]:
-    """v5 startup protection: silence only until the one FFmpeg process has audio.
+    """Keep the downstream encoded stream continuous across cold starts and stalls.
 
-    After the first real chunk, FFmpeg remains alive and owns reconnect behavior.
-    REAL_AUDIO_STALL_SECONDS is diagnostic-only in v5 and never kills/restarts FFmpeg.
+    Startup uses realtime encoded silence until the source produces real audio.
+    After startup, short upstream stalls are also filled with realtime encoded
+    silence so hardware radio clients do not lose decoder/timing state. FFmpeg
+    remains alive and continues owning source reconnect behavior.
     """
     if not STARTUP_SILENCE_ENABLED:
         async for chunk in ffmpeg_audio_stream(channel, fmt, diagnostic_callback=diagnostic_callback):
             if real_audio_event is not None:
                 real_audio_event.set()
+            if output_kind_callback:
+                output_kind_callback(True)
             yield chunk
         return
 
     silence_gen = ffmpeg_silence_stream(fmt)
     real_gen = ffmpeg_audio_stream(channel, fmt, diagnostic_callback=diagnostic_callback)
-    real_task = asyncio.create_task(anext(real_gen))
-    silence_task = asyncio.create_task(anext(silence_gen))
+    real_task: asyncio.Task | None = asyncio.create_task(anext(real_gen))
+    silence_task: asyncio.Task | None = asyncio.create_task(anext(silence_gen))
     startup_deadline = time.monotonic() + UPSTREAM_STARTUP_TIMEOUT_SECONDS
+    gap_fill_active = False
+
     LOGGER.info(
         "Serving startup silence for %s while v5 FFmpeg starts (startup timeout %.0fs)",
         channel.name,
         UPSTREAM_STARTUP_TIMEOUT_SECONDS,
     )
     try:
+        # Cold-start phase.
         while True:
             remaining = startup_deadline - time.monotonic()
             if remaining <= 0:
@@ -2536,38 +2581,117 @@ async def startup_protected_audio_stream(
                     raise RuntimeError("FFmpeg exited before producing real audio") from exc
                 if silence_task and not silence_task.done():
                     silence_task.cancel()
-                    try:
-                        await silence_task
-                    except (asyncio.CancelledError, StopAsyncIteration):
-                        pass
-                await silence_gen.aclose()
+                    await asyncio.gather(silence_task, return_exceptions=True)
+                silence_task = None
                 if real_audio_event is not None:
                     real_audio_event.set()
-                LOGGER.info("Real audio ready for %s; switching from silence and keeping v5 FFmpeg alive", channel.name)
+                if output_kind_callback:
+                    output_kind_callback(True)
+                LOGGER.info("Real audio ready for %s; switching from startup silence", channel.name)
                 yield first
-                async for chunk in real_gen:
-                    yield chunk
-                return
+                real_task = asyncio.create_task(anext(real_gen))
+                break
+
             if silence_task in done:
                 try:
                     chunk = silence_task.result()
                 except StopAsyncIteration as exc:
                     raise RuntimeError("startup silence generator stopped unexpectedly") from exc
+                if output_kind_callback:
+                    output_kind_callback(False)
                 yield chunk
                 silence_task = asyncio.create_task(anext(silence_gen))
+
+        # Steady-state phase. Keep the HTTP/decoder timeline alive during source
+        # stalls instead of letting Echo-class clients sit with zero bytes.
+        while True:
+            if not POST_START_GAP_FILL_ENABLED:
+                try:
+                    chunk = await real_task
+                except StopAsyncIteration:
+                    return
+                if output_kind_callback:
+                    output_kind_callback(True)
+                yield chunk
+                real_task = asyncio.create_task(anext(real_gen))
+                continue
+
+            done, _ = await asyncio.wait(
+                {real_task},
+                timeout=POST_START_GAP_FILL_AFTER_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if done:
+                try:
+                    chunk = real_task.result()
+                except StopAsyncIteration:
+                    return
+                if gap_fill_active:
+                    gap_fill_active = False
+                    if diagnostic_callback:
+                        diagnostic_callback("gap_fill_end")
+                    LOGGER.info("Real audio resumed for %s after gap fill", channel.name)
+                if output_kind_callback:
+                    output_kind_callback(True)
+                yield chunk
+                real_task = asyncio.create_task(anext(real_gen))
+                continue
+
+            if not gap_fill_active:
+                gap_fill_active = True
+                if diagnostic_callback:
+                    diagnostic_callback("gap_fill_start")
+                LOGGER.warning(
+                    "Real audio stalled for %s; filling downstream with silence after %.2fs",
+                    channel.name,
+                    POST_START_GAP_FILL_AFTER_SECONDS,
+                )
+                silence_task = asyncio.create_task(anext(silence_gen))
+
+            while gap_fill_active:
+                assert silence_task is not None
+                done, _ = await asyncio.wait(
+                    {real_task, silence_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if real_task in done:
+                    try:
+                        chunk = real_task.result()
+                    except StopAsyncIteration:
+                        return
+                    if silence_task and not silence_task.done():
+                        silence_task.cancel()
+                        await asyncio.gather(silence_task, return_exceptions=True)
+                    silence_task = None
+                    gap_fill_active = False
+                    if diagnostic_callback:
+                        diagnostic_callback("gap_fill_end")
+                    LOGGER.info("Real audio resumed for %s; ending gap fill", channel.name)
+                    if output_kind_callback:
+                        output_kind_callback(True)
+                    yield chunk
+                    real_task = asyncio.create_task(anext(real_gen))
+                    break
+
+                if silence_task in done:
+                    try:
+                        chunk = silence_task.result()
+                    except StopAsyncIteration as exc:
+                        raise RuntimeError("gap-fill silence generator stopped unexpectedly") from exc
+                    if output_kind_callback:
+                        output_kind_callback(False)
+                    yield chunk
+                    silence_task = asyncio.create_task(anext(silence_gen))
     finally:
-        if real_task and not real_task.done():
-            real_task.cancel()
-            try:
-                await real_task
-            except asyncio.CancelledError:
-                pass
-        if silence_task and not silence_task.done():
-            silence_task.cancel()
-            try:
-                await silence_task
-            except asyncio.CancelledError:
-                pass
+        if gap_fill_active and diagnostic_callback:
+            diagnostic_callback("gap_fill_end")
+        for task in (real_task, silence_task):
+            if task and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (real_task, silence_task) if task is not None),
+            return_exceptions=True,
+        )
         try:
             await real_gen.aclose()
         except Exception:
@@ -2790,7 +2914,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.5",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.6",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
