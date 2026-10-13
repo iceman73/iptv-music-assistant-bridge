@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.6")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.7")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -1030,23 +1030,27 @@ class SharedStreamHub:
             except asyncio.CancelledError:
                 pass
 
-    async def preempt_warmup_for_playback(self) -> bool:
-        """Stop a listener-free pinned warmup immediately so playback gets capacity."""
+    async def preempt_idle_for_playback(self) -> str:
+        """Stop listener-free background demand so a new channel gets capacity.
+
+        Returns "ma_warmup", "linger", or "" when nothing was preempted.
+        """
         async with self.lock:
-            if self.subscribers or self.pins <= 0:
-                return False
+            if self.subscribers:
+                return ""
             task = self.task
             if task is None or task.done():
-                return False
+                return ""
+            reason = "ma_warmup" if self.pins > 0 else "linger"
             self._cancel_linger_locked()
             self.state = "preempted_for_playback"
-        LOGGER.info("Preempting MA warmup hub %s for live playback", self.key)
+        LOGGER.info("Preempting %s hub %s for live playback", reason, self.key)
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-        return True
+        return reason
 
     async def restart_failed_warmup(self) -> bool:
         """Restart a pinned warmup only when doing so cannot disrupt a listener."""
@@ -1164,6 +1168,7 @@ class StreamManager:
         self.playback_idle_event.set()
         self.playback_listeners = 0
         self.ma_warmups_preempted = 0
+        self.linger_hubs_preempted = 0
 
     async def _hub(self, channel: Channel, fmt: str) -> SharedStreamHub:
         key = f"{channel.channel_id}:{fmt}"
@@ -1215,14 +1220,15 @@ class StreamManager:
                     task.cancel()
             await asyncio.gather(audio_task, playback_task, return_exceptions=True)
 
-    async def _preempt_other_warmups(self, exclude_key: str) -> None:
+    async def _preempt_other_background_hubs(self, exclude_key: str) -> None:
         async with self.lock:
             hubs = [hub for key, hub in self.hubs.items() if key != exclude_key]
         results = await asyncio.gather(
-            *(hub.preempt_warmup_for_playback() for hub in hubs),
+            *(hub.preempt_idle_for_playback() for hub in hubs),
             return_exceptions=True,
         )
-        self.ma_warmups_preempted += sum(result is True for result in results)
+        self.ma_warmups_preempted += sum(result == "ma_warmup" for result in results)
+        self.linger_hubs_preempted += sum(result == "linger" for result in results)
 
     async def subscribe(self, channel: Channel, fmt: str) -> AsyncIterator[bytes]:
         # Any HTTP stream consumer is treated as playback demand. This includes
@@ -1230,10 +1236,10 @@ class StreamManager:
         # must favor the listener rather than an unrelated background warmup.
         await self._listener_joined()
         hub = await self._hub(channel, fmt)
-        # If an unrelated MA warmup currently owns an upstream slot, cancel its
-        # FFmpeg immediately. Its hold_warm context will observe playback demand,
-        # release the pin, and retry after playback goes idle.
-        await self._preempt_other_warmups(hub.key)
+        # Channel changes must not wait behind an old channel's 30-second linger
+        # or an unrelated MA warmup. Stop any listener-free background hub before
+        # starting the new playback source.
+        await self._preempt_other_background_hubs(hub.key)
         try:
             async for chunk in hub.subscribe():
                 yield chunk
@@ -1323,6 +1329,7 @@ class StreamManager:
             "playback_priority_active": self.playback_active_event.is_set(),
             "playback_listeners": self.playback_listeners,
             "ma_warmups_preempted": self.ma_warmups_preempted,
+            "linger_hubs_preempted": self.linger_hubs_preempted,
             "linger_seconds": STREAM_LINGER_SECONDS,
             "hubs": rows,
         }
@@ -2206,7 +2213,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.6"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.7"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -2285,7 +2292,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.6", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.7", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2914,7 +2921,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.6",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.7",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
