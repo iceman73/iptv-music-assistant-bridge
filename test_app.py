@@ -543,7 +543,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.4"
+    assert row["version"] == "5.6.5"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -966,3 +966,67 @@ def test_playback_preempts_unrelated_warmup_hub():
                     pass
 
     asyncio.run(run())
+
+
+def test_mp3_output_pacing_limits_burst_rate():
+    async def run():
+        old_enabled = app.STREAM_OUTPUT_PACING
+        old_bitrate = app.MP3_BITRATE
+        old_slack = app.STREAM_OUTPUT_PACING_SLACK_SECONDS
+        sleeps = []
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        async def src():
+            yield b"a" * 24000, True
+            yield b"b" * 24000, True
+            yield b"c" * 24000, True
+
+        try:
+            app.STREAM_OUTPUT_PACING = True
+            app.MP3_BITRATE = "192k"
+            app.STREAM_OUTPUT_PACING_SLACK_SECONDS = 0.25
+            original_sleep = app.asyncio.sleep
+            app.asyncio.sleep = fake_sleep
+            out = [item async for item in app.pace_encoded_audio(src(), "mp3")]
+            assert len(out) == 3
+            assert b"".join(chunk for chunk, _ in out) == (b"a" * 24000 + b"b" * 24000 + b"c" * 24000)
+            assert any(delay >= 0.9 for delay in sleeps)
+        finally:
+            app.asyncio.sleep = original_sleep
+            app.STREAM_OUTPUT_PACING = old_enabled
+            app.MP3_BITRATE = old_bitrate
+            app.STREAM_OUTPUT_PACING_SLACK_SECONDS = old_slack
+
+    asyncio.run(run())
+
+
+def test_output_pacing_passes_silence_without_delay_and_resets_clock():
+    async def run():
+        old_enabled = app.STREAM_OUTPUT_PACING
+        old_bitrate = app.MP3_BITRATE
+        try:
+            app.STREAM_OUTPUT_PACING = True
+            app.MP3_BITRATE = "192k"
+
+            async def src():
+                yield b"S" * 100, False
+                yield b"R" * 100, True
+
+            out = [item async for item in app.pace_encoded_audio(src(), "mp3")]
+            assert out == [(b"S" * 100, False), (b"R" * 100, True)]
+        finally:
+            app.STREAM_OUTPUT_PACING = old_enabled
+            app.MP3_BITRATE = old_bitrate
+
+    asyncio.run(run())
+
+
+def test_bitrate_parser():
+    assert app._bitrate_to_bps("192k") == 192000
+    assert app._bitrate_to_bps("128000") == 128000
+    assert app._bitrate_to_bps("1.5m") == 1500000
+    assert app._bitrate_to_bps("bad") == 0
