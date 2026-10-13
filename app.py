@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.4")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.5")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -124,6 +124,8 @@ STREAM_READ_CHUNK_BYTES = max(1024, int(os.getenv("STREAM_READ_CHUNK_BYTES", "16
 # write granularity. A short max delay prevents extra latency on low-bitrate streams.
 STREAM_COALESCE_BYTES = max(0, int(os.getenv("STREAM_COALESCE_BYTES", "8192")))
 STREAM_COALESCE_MAX_SECONDS = max(0.0, float(os.getenv("STREAM_COALESCE_MAX_SECONDS", "0.50")))
+STREAM_OUTPUT_PACING = os.getenv("STREAM_OUTPUT_PACING", "true").strip().lower() in {"1", "true", "yes", "on"}
+STREAM_OUTPUT_PACING_SLACK_SECONDS = max(0.0, float(os.getenv("STREAM_OUTPUT_PACING_SLACK_SECONDS", "0.25")))
 STREAM_RING_BUFFER_SECONDS = max(0.0, float(os.getenv("STREAM_RING_BUFFER_SECONDS", "2")))
 UPSTREAM_RETRY_INITIAL_SECONDS = max(0.25, float(os.getenv("UPSTREAM_RETRY_INITIAL_SECONDS", "1")))
 UPSTREAM_RETRY_MAX_SECONDS = max(UPSTREAM_RETRY_INITIAL_SECONDS, float(os.getenv("UPSTREAM_RETRY_MAX_SECONDS", "5")))
@@ -551,6 +553,63 @@ def _existing_radio_name(item: dict[str, Any]) -> str:
     return str(item.get("name") or "").strip()
 
 
+def _bitrate_to_bps(value: str) -> int:
+    """Parse FFmpeg-style bitrates such as 192k or 128000."""
+    text = str(value or "").strip().lower()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kmg]?)", text)
+    if not match:
+        return 0
+    number = float(match.group(1))
+    unit = match.group(2)
+    multiplier = {"": 1, "k": 1000, "m": 1_000_000, "g": 1_000_000_000}[unit]
+    return max(0, int(number * multiplier))
+
+
+async def pace_encoded_audio(
+    source: AsyncIterator[tuple[bytes, bool]],
+    fmt: str,
+) -> AsyncIterator[tuple[bytes, bool]]:
+    """Pace real encoded audio at its configured bitrate instead of burst delivery.
+
+    Startup silence is already generated with FFmpeg -re and passes through
+    untouched. For MP3 the bridge uses CBR, so byte-count pacing closely follows
+    media time. When upstream stalls, the clock snaps forward rather than trying
+    to "catch up" with a burst after the gap.
+    """
+    if not STREAM_OUTPUT_PACING or fmt != "mp3":
+        async for item in source:
+            yield item
+        return
+
+    bitrate_bps = _bitrate_to_bps(MP3_BITRATE)
+    if bitrate_bps <= 0:
+        async for item in source:
+            yield item
+        return
+
+    next_send = 0.0
+    was_real = False
+    async for chunk, real_audio in source:
+        if not real_audio:
+            next_send = 0.0
+            was_real = False
+            yield chunk, real_audio
+            continue
+
+        now = time.monotonic()
+        if not was_real or next_send <= 0.0 or now > next_send + STREAM_OUTPUT_PACING_SLACK_SECONDS:
+            next_send = now
+        delay = next_send - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        yield chunk, real_audio
+        sent_at = time.monotonic()
+        media_seconds = (len(chunk) * 8) / bitrate_bps
+        next_send = max(next_send, sent_at) + media_seconds
+        was_real = True
+
+
 async def coalesce_audio_chunks(
     source: AsyncIterator[tuple[bytes, bool]],
     target_bytes: int | None = None,
@@ -822,7 +881,8 @@ class SharedStreamHub:
                                 self.last_real_audio_at = utc_now_iso()
                             yield chunk, real_audio
 
-                    async for chunk, real_audio in coalesce_audio_chunks(tagged_stream()):
+                    coalesced = coalesce_audio_chunks(tagged_stream())
+                    async for chunk, real_audio in pace_encoded_audio(coalesced, self.fmt):
                         await self._broadcast(chunk, real_audio=real_audio)
                     self.last_error = "upstream stream ended"
                 except asyncio.CancelledError:
@@ -1040,6 +1100,9 @@ class SharedStreamHub:
             "avg_chunk_bytes": round(self.total_output_bytes / self.total_chunks, 1) if self.total_chunks else 0.0,
             "coalesce_bytes": STREAM_COALESCE_BYTES,
             "coalesce_max_seconds": STREAM_COALESCE_MAX_SECONDS,
+            "output_pacing_enabled": bool(STREAM_OUTPUT_PACING and self.fmt == "mp3"),
+            "output_pacing_target_kbps": round(_bitrate_to_bps(MP3_BITRATE) / 1000, 1) if self.fmt == "mp3" else None,
+            "output_pacing_slack_seconds": STREAM_OUTPUT_PACING_SLACK_SECONDS,
             "ring_buffer_seconds": STREAM_RING_BUFFER_SECONDS,
             "ring_buffer_chunks": len(self._ring_buffer),
             "upstream_http_503_count": self.upstream_http_503_count,
@@ -2108,7 +2171,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.4"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.5"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -2187,7 +2250,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.4", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.5", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2727,7 +2790,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.4",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.5",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
