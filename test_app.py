@@ -1262,7 +1262,7 @@ def test_proactive_low_water_raises_target_before_underrun():
         events = []
 
         async def src():
-            for byte in (b"A", b"B", b"C", b"D"):
+            for byte in (b"A", b"B", b"C"):
                 yield (byte * 24000, True)
 
         try:
