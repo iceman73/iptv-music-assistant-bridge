@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.8**
+Current release: **v5.6.9**
 
 ## Features
 
@@ -29,7 +29,7 @@ Current release: **v5.6.8**
 - Live playback priority over Music Assistant background warmups
 - Real-time MP3 output pacing to smooth burst-delivered sources
 - Shorter reconnect pre-roll to reduce audible repeats
-- MP3 jitter buffer to smooth bursty upstream delivery before realtime pacing
+- Adaptive per-channel jitter buffering to smooth bursty upstream delivery before realtime pacing
 - Post-start gap fill is disabled by default because separately encoded silence can upset Echo playback
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
@@ -282,8 +282,13 @@ MA_REMOVE_MISSING=false
 | `STREAM_OUTPUT_PACING` | `true` | Pace MP3 delivery at the configured bitrate instead of forwarding upstream bursts |
 | `STREAM_OUTPUT_PACING_SLACK_SECONDS` | `0.25` | Reset pacing after a real upstream gap instead of catching up with a burst |
 | `STREAM_JITTER_BUFFER_ENABLED` | `true` | Buffer encoded MP3 ahead of playback to absorb short upstream delivery gaps |
-| `STREAM_JITTER_BUFFER_SECONDS` | `2.0` | Target MP3 reserve before playback starts or resumes after a full underrun |
-| `STREAM_JITTER_BUFFER_MAX_SECONDS` | `8.0` | Maximum encoded MP3 reserve kept by the jitter buffer |
+| `STREAM_JITTER_BUFFER_ADAPTIVE` | `true` | Learn a working reserve independently for each active channel |
+| `STREAM_JITTER_BUFFER_MIN_SECONDS` | `2.0` | Lowest adaptive reserve target |
+| `STREAM_JITTER_BUFFER_INCREASE_SECONDS` | `2.0` | Increase the channel target by this amount after an underrun |
+| `STREAM_JITTER_BUFFER_DECREASE_SECONDS` | `1.0` | Reduce the channel target by this amount after a stable period |
+| `STREAM_JITTER_BUFFER_STABLE_SECONDS` | `600` | Stable playback time required before reducing the target |
+| `STREAM_JITTER_BUFFER_SECONDS` | `4.0` | Initial per-channel MP3 reserve target |
+| `STREAM_JITTER_BUFFER_MAX_SECONDS` | `16.0` | Maximum adaptive encoded MP3 reserve for a bursty channel |
 | `STREAM_RING_BUFFER_SECONDS` | `0.5` | Short reconnect pre-roll; reduced to limit audible repeats |
 | `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
 | `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
@@ -361,6 +366,28 @@ Live stream listeners now take priority over Music Assistant catalog warmups. Th
 
 `/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
 
+### v5.6.9 adaptive per-channel jitter buffer
+
+v5.6.9 makes the MP3 reserve adaptive per active channel. Each hub starts at the configured target, increases its working reserve after a real underrun, and slowly backs the target down after sustained stable playback. This lets steadier stations run with less latency while burstier stations learn that they need more protection.
+
+Default behavior:
+
+```env
+STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_ADAPTIVE=true
+STREAM_JITTER_BUFFER_MIN_SECONDS=2.0
+STREAM_JITTER_BUFFER_SECONDS=4.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=16.0
+STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
+STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
+STREAM_JITTER_BUFFER_STABLE_SECONDS=600
+POST_START_GAP_FILL_ENABLED=false
+```
+
+A channel starts at 4 seconds. Each underrun raises its working target by 2 seconds, up to 16 seconds. After 10 minutes without an underrun, the target drops by 1 second, no lower than 2 seconds. The learned target stays with the active hub across source reacquisition attempts.
+
+`/streams` now reports `jitter_buffer_adaptive_target_seconds`, `jitter_buffer_target_increases`, and `jitter_buffer_target_decreases` in addition to the existing jitter diagnostics.
+
 ### v5.6.8 MP3 jitter buffer
 
 v5.6.8 adds a small encoded-MP3 jitter buffer ahead of the existing 192 kbps pacing stage. The bridge now reads bursty FFmpeg output into a reserve, then drains that reserve at the configured MP3 bitrate. This absorbs short source-delivery pauses without splicing a second MP3 encoder into the live stream.
@@ -369,8 +396,13 @@ Defaults:
 
 ```env
 STREAM_JITTER_BUFFER_ENABLED=true
-STREAM_JITTER_BUFFER_SECONDS=2.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
+STREAM_JITTER_BUFFER_ADAPTIVE=true
+STREAM_JITTER_BUFFER_MIN_SECONDS=2.0
+STREAM_JITTER_BUFFER_SECONDS=4.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=16.0
+STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
+STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
+STREAM_JITTER_BUFFER_STABLE_SECONDS=600
 POST_START_GAP_FILL_ENABLED=false
 ```
 
