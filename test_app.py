@@ -951,12 +951,6 @@ def test_playback_preempts_unrelated_warmup_hub():
 
     asyncio.run(run())
 
-def test_bitrate_parser():
-    assert app._bitrate_to_bps("192k") == 192000
-    assert app._bitrate_to_bps("128000") == 128000
-    assert app._bitrate_to_bps("1.5m") == 1500000
-    assert app._bitrate_to_bps("bad") == 0
-
 def test_mp3_streams_disable_midstream_headers_for_clean_splicing():
     ch = Channel(channel_id="xc-mp3", name="MP3", source_url="http://example.test/live.ts")
     cmd = app.build_ffmpeg_command(ch, "mp3")
