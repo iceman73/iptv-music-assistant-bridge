@@ -39,7 +39,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.3")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.4")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -992,6 +992,7 @@ class SharedStreamHub:
             "name": self.channel.name,
             "format": self.fmt,
             "running": bool(self.task and not self.task.done()),
+            "demand_type": "playback" if self.subscribers else ("ma_warmup" if self.pins else "linger"),
             "listeners": len(self.subscribers),
             "pins": self.pins,
             "real_audio_ready": self.real_audio_ready.is_set(),
@@ -1034,10 +1035,18 @@ class SharedStreamHub:
         }
 
 
+class PlaybackPriorityPreempted(RuntimeError):
+    """Internal signal used when live playback takes priority over MA warmup."""
+
+
 class StreamManager:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.hubs: dict[str, SharedStreamHub] = {}
+        self.playback_active_event = asyncio.Event()
+        self.playback_idle_event = asyncio.Event()
+        self.playback_idle_event.set()
+        self.playback_listeners = 0
 
     async def _hub(self, channel: Channel, fmt: str) -> SharedStreamHub:
         key = f"{channel.channel_id}:{fmt}"
@@ -1050,53 +1059,122 @@ class StreamManager:
                 hub.channel = channel
             return hub
 
+    async def _listener_joined(self) -> None:
+        async with self.lock:
+            self.playback_listeners += 1
+            self.playback_active_event.set()
+            self.playback_idle_event.clear()
+
+    async def _listener_left(self) -> None:
+        async with self.lock:
+            self.playback_listeners = max(0, self.playback_listeners - 1)
+            if self.playback_listeners == 0:
+                self.playback_active_event.clear()
+                self.playback_idle_event.set()
+
+    async def wait_for_playback_idle(self) -> None:
+        await self.playback_idle_event.wait()
+
+    async def _wait_for_real_audio_or_playback(self, hub: SharedStreamHub, timeout: float) -> None:
+        """Wait for a warm source, but immediately yield capacity to playback."""
+        if self.playback_active_event.is_set():
+            raise PlaybackPriorityPreempted("live playback became active")
+        audio_task = asyncio.create_task(hub.wait_for_real_audio(timeout))
+        playback_task = asyncio.create_task(self.playback_active_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {audio_task, playback_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if playback_task in done and self.playback_active_event.is_set():
+                raise PlaybackPriorityPreempted("live playback became active")
+            if audio_task in done:
+                await audio_task
+                return
+            raise asyncio.TimeoutError
+        finally:
+            for task in (audio_task, playback_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(audio_task, playback_task, return_exceptions=True)
+
     async def subscribe(self, channel: Channel, fmt: str) -> AsyncIterator[bytes]:
+        # Any HTTP stream consumer is treated as playback demand. This includes
+        # MA's short validation connection, which is exactly when source capacity
+        # must favor the listener rather than an unrelated background warmup.
+        await self._listener_joined()
         hub = await self._hub(channel, fmt)
-        async for chunk in hub.subscribe():
-            yield chunk
+        try:
+            async for chunk in hub.subscribe():
+                yield chunk
+        finally:
+            await self._listener_left()
 
     @asynccontextmanager
     async def hold_warm(self, channel: Channel, fmt: str) -> AsyncIterator[SharedStreamHub]:
         hub = await self._hub(channel, fmt)
-        await hub.pin()
-        released = False
-        try:
-            if STREAM_WARMUP_ENABLED:
-                for attempt in range(1, STREAM_WARMUP_RETRIES + 1):
-                    try:
-                        await hub.wait_for_real_audio(STREAM_WARMUP_TIMEOUT)
-                        LOGGER.info(
-                            "Shared stream ready for %s; holding same upstream during MA add",
-                            channel.name,
-                        )
-                        break
-                    except asyncio.TimeoutError as exc:
-                        if attempt < STREAM_WARMUP_RETRIES:
-                            LOGGER.warning(
-                                "Warmup timed out for %s after %.0fs (attempt %d/%d); restarting cold source",
+
+        # Background MA import work never competes with a live listener. If
+        # playback starts while a source is warming, tear down the listener-free
+        # warmup immediately, wait for playback to go idle, and then retry.
+        while True:
+            await self.wait_for_playback_idle()
+            await hub.pin()
+            released = False
+            retry_after_playback = False
+            try:
+                if self.playback_active_event.is_set():
+                    raise PlaybackPriorityPreempted("live playback became active")
+
+                if STREAM_WARMUP_ENABLED:
+                    for attempt in range(1, STREAM_WARMUP_RETRIES + 1):
+                        try:
+                            await self._wait_for_real_audio_or_playback(hub, STREAM_WARMUP_TIMEOUT)
+                            LOGGER.info(
+                                "Shared stream ready for %s; holding same upstream during MA add",
                                 channel.name,
-                                STREAM_WARMUP_TIMEOUT,
-                                attempt,
-                                STREAM_WARMUP_RETRIES,
                             )
-                            restarted = await hub.restart_failed_warmup()
-                            if restarted and STREAM_WARMUP_RETRY_DELAY:
-                                await asyncio.sleep(STREAM_WARMUP_RETRY_DELAY)
-                            continue
-                        await hub.unpin(stop_if_unready=True)
-                        released = True
-                        raise RuntimeError(
-                            f"WarmupTimeout: no real audio after {STREAM_WARMUP_TIMEOUT:.0f}s "
-                            f"for {STREAM_WARMUP_RETRIES} attempt(s)"
-                        ) from exc
-            yield hub
-        finally:
-            if not released:
-                # MA import warmups are synthetic demand. Once the add/grace
-                # window is over, do not leave a listener-free warmup hub in
-                # the normal playback linger period or it can consume one of
-                # the scarce upstream slots needed by the next station.
-                await hub.unpin(stop_if_idle=True)
+                            break
+                        except PlaybackPriorityPreempted:
+                            raise
+                        except asyncio.TimeoutError as exc:
+                            if attempt < STREAM_WARMUP_RETRIES:
+                                LOGGER.warning(
+                                    "Warmup timed out for %s after %.0fs (attempt %d/%d); restarting cold source",
+                                    channel.name,
+                                    STREAM_WARMUP_TIMEOUT,
+                                    attempt,
+                                    STREAM_WARMUP_RETRIES,
+                                )
+                                restarted = await hub.restart_failed_warmup()
+                                if restarted and STREAM_WARMUP_RETRY_DELAY:
+                                    await asyncio.sleep(STREAM_WARMUP_RETRY_DELAY)
+                                continue
+                            await hub.unpin(stop_if_unready=True)
+                            released = True
+                            raise RuntimeError(
+                                f"WarmupTimeout: no real audio after {STREAM_WARMUP_TIMEOUT:.0f}s "
+                                f"for {STREAM_WARMUP_RETRIES} attempt(s)"
+                            ) from exc
+                yield hub
+                return
+            except PlaybackPriorityPreempted:
+                retry_after_playback = True
+                LOGGER.info(
+                    "Pausing MA warmup for %s because live playback has priority",
+                    channel.name,
+                )
+            finally:
+                if not released:
+                    # MA import warmups are synthetic demand. Once the add/grace
+                    # window is over, or playback preempts the warmup, release it
+                    # immediately instead of entering the normal playback linger.
+                    await hub.unpin(stop_if_idle=True)
+                    released = True
+
+            if retry_after_playback:
+                await self.wait_for_playback_idle()
+                continue
 
     def has_active_hubs(self) -> bool:
         return any(hub.task and not hub.task.done() for hub in self.hubs.values())
@@ -1112,10 +1190,11 @@ class StreamManager:
             "active_hubs": len(rows),
             "listeners": sum(row["listeners"] for row in rows),
             "pins": sum(row["pins"] for row in rows),
+            "playback_priority_active": self.playback_active_event.is_set(),
+            "playback_listeners": self.playback_listeners,
             "linger_seconds": STREAM_LINGER_SECONDS,
             "hubs": rows,
         }
-
 
 class MusicAssistantSyncService:
     """Keep Music Assistant Builtin Radio entries aligned with the bridge catalog.
@@ -1410,25 +1489,58 @@ class MusicAssistantSyncService:
         }
 
     async def _add_radio_with_warm_source(self, channel: Channel, args: dict[str, Any]) -> None:
-        """Warm the source, keep it open through every MA add retry, then close it."""
-        async with stream_manager.hold_warm(channel, IMPORT_FORMAT):
-            last_exc: Exception | None = None
-            for attempt in range(1, MA_ADD_RETRIES + 1):
-                try:
-                    await self._call("builtin/add_radio", args)
-                    if MA_IMPORT_RELEASE_GRACE_SECONDS:
-                        await asyncio.sleep(MA_IMPORT_RELEASE_GRACE_SECONDS)
-                    return
-                except Exception as exc:
-                    last_exc = exc
-                    LOGGER.warning(
-                        "MA add_radio failed for %s (attempt %d/%d) while warm source remains open: %s",
-                        channel.name, attempt, MA_ADD_RETRIES, exc,
-                    )
-                    if attempt < MA_ADD_RETRIES and MA_ADD_RETRY_DELAY:
-                        await asyncio.sleep(MA_ADD_RETRY_DELAY)
-            assert last_exc is not None
-            raise last_exc
+        """Warm/import only while playback capacity is idle."""
+        while True:
+            await stream_manager.wait_for_playback_idle()
+            try:
+                async with stream_manager.hold_warm(channel, IMPORT_FORMAT):
+                    last_exc: Exception | None = None
+                    for attempt in range(1, MA_ADD_RETRIES + 1):
+                        if stream_manager.playback_active_event.is_set():
+                            raise PlaybackPriorityPreempted("live playback became active")
+                        try:
+                            await self._call("builtin/add_radio", args)
+                            if MA_IMPORT_RELEASE_GRACE_SECONDS:
+                                try:
+                                    await asyncio.wait_for(
+                                        stream_manager.playback_active_event.wait(),
+                                        timeout=MA_IMPORT_RELEASE_GRACE_SECONDS,
+                                    )
+                                    LOGGER.info(
+                                        "Ending MA import grace early for %s because playback became active",
+                                        channel.name,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                            return
+                        except PlaybackPriorityPreempted:
+                            raise
+                        except Exception as exc:
+                            last_exc = exc
+                            LOGGER.warning(
+                                "MA add_radio failed for %s (attempt %d/%d) while warm source remains open: %s",
+                                channel.name, attempt, MA_ADD_RETRIES, exc,
+                            )
+                            if stream_manager.playback_active_event.is_set():
+                                raise PlaybackPriorityPreempted("live playback became active") from exc
+                            if attempt < MA_ADD_RETRIES and MA_ADD_RETRY_DELAY:
+                                try:
+                                    await asyncio.wait_for(
+                                        stream_manager.playback_active_event.wait(),
+                                        timeout=MA_ADD_RETRY_DELAY,
+                                    )
+                                    raise PlaybackPriorityPreempted("live playback became active")
+                                except asyncio.TimeoutError:
+                                    pass
+                    assert last_exc is not None
+                    raise last_exc
+            except PlaybackPriorityPreempted:
+                LOGGER.info(
+                    "Deferring MA add/update for %s until live playback is idle",
+                    channel.name,
+                )
+                await stream_manager.wait_for_playback_idle()
+                continue
 
     async def sync(self, channels: list[Channel], reason: str = "manual") -> dict[str, Any]:
         if IMPORT_FORMAT not in {"aac", "mp3"}:
@@ -1963,7 +2075,7 @@ class MetadataService:
         return items
 
     async def _refresh_ticker(self) -> None:
-        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.3"}
+        headers = {"User-Agent": "Ticker/0.1 Dispatcharr-MA-Bridge/5.6.4"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
             await self._refresh_ticker_channels(client)
             response = await client.get(TICKER_NOWPLAYING_URL)
@@ -2042,7 +2154,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.3", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version="5.6.4", lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2582,7 +2694,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.3",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.4",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
