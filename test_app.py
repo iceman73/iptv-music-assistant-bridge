@@ -190,10 +190,12 @@ def test_shared_hub_reuses_same_upstream_during_linger():
         old_linger = app.STREAM_LINGER_SECONDS
         starts = {"count": 0}
 
-        async def fake_source(channel, fmt, real_audio_event=None, diagnostic_callback=None):
+        async def fake_source(channel, fmt, real_audio_event=None, diagnostic_callback=None, output_kind_callback=None):
             starts["count"] += 1
             if real_audio_event is not None:
                 real_audio_event.set()
+            if output_kind_callback is not None:
+                output_kind_callback(True)
             i = 0
             while True:
                 await asyncio.sleep(0.005)
@@ -226,7 +228,7 @@ def test_shared_hub_reuses_same_upstream_during_linger():
             app.startup_protected_audio_stream = old_source
             app.STREAM_LINGER_SECONDS = old_linger
 
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
 
 
 def test_ma_sync_skips_unchanged_and_only_imports_new_station():
