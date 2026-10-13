@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.4**
+Current release: **v5.6.5**
 
 ## Features
 
@@ -27,6 +27,8 @@ Current release: **v5.6.4**
 - Music Assistant per-radio audit endpoint for stale AAC/MP3, duplicate, missing, and source-removed entries
 - Safe dry-run and bulk removal endpoint for bridge-managed Music Assistant radios
 - Live playback priority over Music Assistant background warmups
+- Real-time MP3 output pacing to smooth burst-delivered sources
+- Shorter reconnect pre-roll to reduce audible repeats
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
@@ -222,7 +224,12 @@ STREAM_SUBSCRIBER_QUEUE_CHUNKS=16
 STREAM_READ_CHUNK_BYTES=16384
 STREAM_COALESCE_BYTES=8192
 STREAM_COALESCE_MAX_SECONDS=0.50
-STREAM_RING_BUFFER_SECONDS=2
+STREAM_OUTPUT_PACING=true
+STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
+STREAM_RING_BUFFER_SECONDS=0.5
+STREAM_OUTPUT_PACING=true
+STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
+STREAM_RING_BUFFER_SECONDS=0.5
 
 # Metadata
 METADATA_ENABLED=true
@@ -264,7 +271,9 @@ MA_REMOVE_MISSING=false
 | `STREAM_READ_CHUNK_BYTES` | `16384` | Maximum FFmpeg pipe read request; actual reads may be much smaller |
 | `STREAM_COALESCE_BYTES` | `8192` | Coalesce small encoded reads into steadier client writes; `0` disables |
 | `STREAM_COALESCE_MAX_SECONDS` | `0.50` | Maximum time to hold a partial coalesced write |
-| `STREAM_RING_BUFFER_SECONDS` | `2` | Encoded reconnect pre-roll |
+| `STREAM_OUTPUT_PACING` | `true` | Pace MP3 delivery at the configured bitrate instead of forwarding upstream bursts |
+| `STREAM_OUTPUT_PACING_SLACK_SECONDS` | `0.25` | Reset pacing after a real upstream gap instead of catching up with a burst |
+| `STREAM_RING_BUFFER_SECONDS` | `0.5` | Short reconnect pre-roll; reduced to limit audible repeats |
 | `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
 | `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
 | `FFMPEG_LOG_LEVEL` | `warning` | FFmpeg log verbosity |
@@ -338,6 +347,25 @@ After a Music Assistant add/update finishes its release-grace window, a listener
 Live stream listeners now take priority over Music Assistant catalog warmups. The bridge will not start a new MA warmup while any stream listener is active. If playback begins while an unrelated MA warmup owns an upstream slot, that warmup's FFmpeg process is cancelled immediately, its pin is released, and the import resumes after playback becomes idle. The MA release-grace period also ends early when playback becomes active.
 
 `/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
+
+### v5.6.5 MP3 pacing and reconnect smoothing
+
+v5.6.5 adds real-time pacing for the MP3 path. Some IPTV sources deliver several seconds of audio in a burst and then pause. Browsers tolerate that well, but Music Assistant and Echo players can produce skips, crackle, or uneven playback. The bridge now spaces MP3 writes according to `MP3_BITRATE` instead of immediately forwarding each burst.
+
+Pacing only applies to real MP3 audio. Startup silence is already generated in real time and is not delayed again. After a genuine upstream gap, the pacing clock resets rather than trying to catch up with a large burst.
+
+The reconnect ring-buffer default is also reduced from 2 seconds to 0.5 seconds. Replaying a full two seconds of pre-roll after an MA reconnect could be heard as an obvious repeat.
+
+Recommended Echo-facing values:
+
+```env
+MP3_BITRATE=192k
+STREAM_OUTPUT_PACING=true
+STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
+STREAM_RING_BUFFER_SECONDS=0.5
+```
+
+`/streams` reports `output_pacing_enabled`, `output_pacing_target_kbps`, and `output_pacing_slack_seconds`. On a steady 192 kbps stream, `recent_real_kbps` should settle near the configured rate rather than showing large 800+ kbps bursts.
 
 ### v5.4 stream write smoothing
 
