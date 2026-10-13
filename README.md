@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.6**
+Current release: **v5.6.8**
 
 ## Features
 
@@ -29,7 +29,8 @@ Current release: **v5.6.6**
 - Live playback priority over Music Assistant background warmups
 - Real-time MP3 output pacing to smooth burst-delivered sources
 - Shorter reconnect pre-roll to reduce audible repeats
-- Post-start silence gap fill to keep Echo decoder/timing state stable
+- MP3 jitter buffer to smooth bursty upstream delivery before realtime pacing
+- Post-start gap fill is disabled by default because separately encoded silence can upset Echo playback
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
@@ -227,9 +228,15 @@ STREAM_COALESCE_BYTES=8192
 STREAM_COALESCE_MAX_SECONDS=0.50
 STREAM_OUTPUT_PACING=true
 STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
+STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_SECONDS=2.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
 STREAM_RING_BUFFER_SECONDS=0.5
 STREAM_OUTPUT_PACING=true
 STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
+STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_SECONDS=2.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
 STREAM_RING_BUFFER_SECONDS=0.5
 
 # Metadata
@@ -274,10 +281,13 @@ MA_REMOVE_MISSING=false
 | `STREAM_COALESCE_MAX_SECONDS` | `0.50` | Maximum time to hold a partial coalesced write |
 | `STREAM_OUTPUT_PACING` | `true` | Pace MP3 delivery at the configured bitrate instead of forwarding upstream bursts |
 | `STREAM_OUTPUT_PACING_SLACK_SECONDS` | `0.25` | Reset pacing after a real upstream gap instead of catching up with a burst |
+| `STREAM_JITTER_BUFFER_ENABLED` | `true` | Buffer encoded MP3 ahead of playback to absorb short upstream delivery gaps |
+| `STREAM_JITTER_BUFFER_SECONDS` | `2.0` | Target MP3 reserve before playback starts or resumes after a full underrun |
+| `STREAM_JITTER_BUFFER_MAX_SECONDS` | `8.0` | Maximum encoded MP3 reserve kept by the jitter buffer |
 | `STREAM_RING_BUFFER_SECONDS` | `0.5` | Short reconnect pre-roll; reduced to limit audible repeats |
 | `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
 | `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
-| `POST_START_GAP_FILL_ENABLED` | `true` | Continue sending valid encoded silence during post-start source stalls |
+| `POST_START_GAP_FILL_ENABLED` | `false` | Optional post-start encoded-silence fill; disabled by default for Echo stability |
 | `POST_START_GAP_FILL_AFTER_SECONDS` | `0.75` | Start gap fill after this long without real source audio |
 | `FFMPEG_LOG_LEVEL` | `warning` | FFmpeg log verbosity |
 
@@ -351,6 +361,23 @@ Live stream listeners now take priority over Music Assistant catalog warmups. Th
 
 `/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
 
+### v5.6.8 MP3 jitter buffer
+
+v5.6.8 adds a small encoded-MP3 jitter buffer ahead of the existing 192 kbps pacing stage. The bridge now reads bursty FFmpeg output into a reserve, then drains that reserve at the configured MP3 bitrate. This absorbs short source-delivery pauses without splicing a second MP3 encoder into the live stream.
+
+Defaults:
+
+```env
+STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_SECONDS=2.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
+POST_START_GAP_FILL_ENABLED=false
+```
+
+The 2-second reserve adds roughly two seconds to initial real-audio startup, but it is designed to prevent short Dispatcharr/XC starvation periods from becoming audible skips on Echo devices. If the buffer is fully exhausted, the bridge re-primes instead of repeatedly starting and stopping on tiny bursts.
+
+`/streams` reports `jitter_buffer_current_seconds`, `jitter_buffer_max_observed_seconds`, `jitter_buffer_primed`, and `jitter_buffer_underruns` for validation.
+
 ### v5.6.6 post-start gap fill
 
 Echo playback can remain connected while the IPTV source temporarily stops producing audio, then resume with static or jumpy decoder state. v5.6.6 keeps the same downstream HTTP stream alive with valid realtime encoded silence whenever real audio stalls for more than `POST_START_GAP_FILL_AFTER_SECONDS` (default 0.75 seconds). When source audio resumes, the bridge switches back without restarting the client.
@@ -373,6 +400,9 @@ Recommended Echo-facing values:
 MP3_BITRATE=192k
 STREAM_OUTPUT_PACING=true
 STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
+STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_SECONDS=2.0
+STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
 STREAM_RING_BUFFER_SECONDS=0.5
 ```
 
