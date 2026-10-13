@@ -4,9 +4,9 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.12**
+Current release: **v5.6.13**
 
-v5.6.12 keeps the simplified Echo-safe playback path and fixes the coalescer so `STREAM_COALESCE_MAX_SECONDS` is a true wall-clock deadline. Partial writes now flush even when FFmpeg produces no new bytes. Stream diagnostics also report real-chunk gap duration and counts over 1, 3, 5, and 10 seconds.
+v5.6.13 keeps the Echo-safe Python path simple and adds FFmpeg `-readrate 1` before the live MPEG-TS input. FFmpeg now consumes the timestamped source at media rate before MP3 encoding, while Python output pacing and jitter buffering remain disabled. Gap diagnostics now include the current in-progress gap and effective maximum gap.
 
 ## Features
 
@@ -14,7 +14,7 @@ v5.6.12 keeps the simplified Echo-safe playback path and fixes the coalescer so 
 - AAC and MP3 radio endpoints for Music Assistant
 - MP3 is the default output/import format for improved Amazon Echo compatibility
 - Shared upstream stream per channel and format
-- Coalesced 8 KB client writes to smooth tiny FFmpeg pipe reads
+- FFmpeg media-time input pacing (`-readrate 1`) plus coalesced 8 KB client writes
 - Configurable upstream connection limit
 - 30-second hot-stream linger to avoid unnecessary reconnects
 - Startup silence while a cold IPTV stream opens
@@ -364,9 +364,9 @@ Live stream listeners now take priority over Music Assistant catalog warmups. Th
 
 `/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
 
-### v5.6.12 proactive Echo jitter learning
+### v5.6.13 proactive Echo jitter learning
 
-v5.6.12 changes adaptive buffering so the bridge no longer waits for an actual underrun before learning that a station needs more reserve. A new station starts at 8 seconds. When the live reserve falls to the 2-second low-water mark, the bridge immediately raises and persists that channel's learned target by 2 seconds for the next clean tune or source reacquisition, up to 20 seconds.
+v5.6.13 changes adaptive buffering so the bridge no longer waits for an actual underrun before learning that a station needs more reserve. A new station starts at 8 seconds. When the live reserve falls to the 2-second low-water mark, the bridge immediately raises and persists that channel's learned target by 2 seconds for the next clean tune or source reacquisition, up to 20 seconds.
 
 Learned targets are stored in `/data/jitter-targets.json` by default, so Classic Vinyl, 80s on 8, and other channels can retain different reserve requirements across hub recreation and container restart.
 

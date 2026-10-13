@@ -40,7 +40,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.12")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.13")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -1468,7 +1468,15 @@ class SharedStreamHub:
             "last_real_chunk_at": self.last_real_chunk_at,
             "seconds_since_last_chunk": round(now_mono - self._last_chunk_monotonic, 3) if self._last_chunk_monotonic else None,
             "seconds_since_last_real_chunk": round(now_mono - self._last_real_chunk_monotonic, 3) if self._last_real_chunk_monotonic else None,
+            "current_real_chunk_gap_seconds": round(now_mono - self._last_real_chunk_monotonic, 3) if self._last_real_chunk_monotonic else 0.0,
             "max_real_chunk_gap_seconds": round(self.max_real_chunk_gap_seconds, 3),
+            "effective_max_real_chunk_gap_seconds": round(
+                max(
+                    self.max_real_chunk_gap_seconds,
+                    (now_mono - self._last_real_chunk_monotonic) if self._last_real_chunk_monotonic else 0.0,
+                ),
+                3,
+            ),
             "avg_real_chunk_gap_seconds": round(
                 self.real_chunk_gap_total_seconds / self.real_chunk_gap_count, 3
             ) if self.real_chunk_gap_count else 0.0,
@@ -2744,6 +2752,10 @@ def build_ffmpeg_command(channel: Channel, fmt: str, source_codec: str = "", for
         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
         "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "408,429,5xx",
         "-reconnect_delay_max", "2", "-user_agent", DISPATCHARR_USER_AGENT,
+        # Pace the timestamped MPEG-TS/AAC source in media time before MP3 encoding.
+        # This smooths burst-delivered upstream data without pacing raw MP3 bytes
+        # in Python, which caused Echo crackle/corruption.
+        "-readrate", "1",
         "-i", source, "-map", "0:a:0?", "-vn", "-sn", "-dn",
     ]
     if fmt == "aac":
@@ -3314,7 +3326,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.12",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.13",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,

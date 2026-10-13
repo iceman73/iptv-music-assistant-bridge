@@ -549,7 +549,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.12"
+    assert row["version"] == "5.6.13"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -563,6 +563,29 @@ def test_coalesces_tiny_ffmpeg_reads_without_changing_bytes():
         out = [item async for item in app.coalesce_audio_chunks(src(), target_bytes=8, max_delay_seconds=60)]
         assert out == [(b"abcdefgh", True), (b"ij", True)]
         assert b"".join(chunk for chunk, _ in out) == b"abcdefghij"
+
+    asyncio.run(run())
+
+
+def test_ffmpeg_mp3_uses_readrate_before_input():
+    ch = Channel(channel_id="xc-readrate", name="Readrate", source_url="http://example.test/live.ts")
+    cmd = app.build_ffmpeg_command(ch, "mp3")
+    readrate_index = cmd.index("-readrate")
+    input_index = cmd.index("-i")
+    assert cmd[readrate_index + 1] == "1"
+    assert readrate_index < input_index
+
+
+def test_stream_hub_effective_gap_includes_current_in_progress_gap():
+    async def run():
+        ch = Channel(channel_id="xc-gap-live", name="Gap Live", source_url="http://example.test/live.ts")
+        hub = app.SharedStreamHub(ch, "mp3")
+        await hub._broadcast(b"A" * 100, real_audio=True)
+        hub._last_real_chunk_monotonic -= 7.0
+        status = hub.status()
+        assert status["current_real_chunk_gap_seconds"] >= 6.9
+        assert status["effective_max_real_chunk_gap_seconds"] >= 6.9
+        assert status["max_real_chunk_gap_seconds"] == 0.0
 
     asyncio.run(run())
 
