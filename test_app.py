@@ -548,7 +548,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.7"
+    assert row["version"] == "5.6.8"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -1143,3 +1143,54 @@ def test_channel_switch_preempts_old_linger_hub():
                     pass
 
     asyncio.run(asyncio.wait_for(run(), timeout=2.0))
+
+
+def test_mp3_jitter_buffer_primes_before_real_output():
+    async def run():
+        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
+        old_seconds = app.STREAM_JITTER_BUFFER_SECONDS
+        old_max = app.STREAM_JITTER_BUFFER_MAX_SECONDS
+        old_bitrate = app.MP3_BITRATE
+        events = []
+
+        async def src():
+            yield (b"A" * 24000, True)
+            yield (b"B" * 24000, True)
+            yield (b"C" * 24000, True)
+
+        try:
+            app.STREAM_JITTER_BUFFER_ENABLED = True
+            app.STREAM_JITTER_BUFFER_SECONDS = 2.0
+            app.STREAM_JITTER_BUFFER_MAX_SECONDS = 8.0
+            app.MP3_BITRATE = "192k"
+
+            gen = app.jitter_buffer_encoded_audio(src(), "mp3", status_callback=lambda e, v: events.append((e, v)))
+            first = await asyncio.wait_for(anext(gen), timeout=0.5)
+            assert first == (b"A" * 24000, True)
+            assert any(event == "primed" and value >= 2.0 for event, value in events)
+            await gen.aclose()
+        finally:
+            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
+            app.STREAM_JITTER_BUFFER_SECONDS = old_seconds
+            app.STREAM_JITTER_BUFFER_MAX_SECONDS = old_max
+            app.MP3_BITRATE = old_bitrate
+
+    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
+
+
+def test_jitter_buffer_passthrough_for_aac():
+    async def run():
+        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
+        try:
+            app.STREAM_JITTER_BUFFER_ENABLED = True
+
+            async def src():
+                yield (b"A", True)
+                yield (b"B", True)
+
+            out = [item async for item in app.jitter_buffer_encoded_audio(src(), "aac")]
+            assert out == [(b"A", True), (b"B", True)]
+        finally:
+            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
+
+    asyncio.run(run())
