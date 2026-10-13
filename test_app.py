@@ -537,7 +537,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.2"
+    assert row["version"] == "5.6.3"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -784,3 +784,59 @@ def test_real_audio_clears_stale_last_error():
     hub._record_chunk(b"abc", real_audio=True)
     assert hub.last_error == ""
     assert hub.state == "real_audio"
+
+
+def test_remove_all_managed_radios_dry_run_and_execute():
+    async def run():
+        service = app.MusicAssistantSyncService()
+        managed = [
+            {
+                "item_id": "11",
+                "name": "One",
+                "provider_mappings": [{
+                    "provider_domain": "builtin",
+                    "provider_instance": "builtin",
+                    "item_id": "http://localhost:8088/stream/xc-11.aac",
+                }],
+            },
+            {
+                "item_id": "12",
+                "name": "Two",
+                "provider_mappings": [{
+                    "provider_domain": "builtin",
+                    "provider_instance": "builtin",
+                    "item_id": "http://localhost:8088/stream/xc-12.mp3",
+                }],
+            },
+        ]
+
+        old_prefix = app.MA_MANAGED_URL_PREFIX
+        try:
+            app.MA_MANAGED_URL_PREFIX = "http://localhost:8088/stream/"
+
+            async def fake_managed():
+                return managed
+
+            removed_ids = []
+
+            async def fake_remove(item):
+                removed_ids.append(str(item["item_id"]))
+
+            service._managed_library_radios = fake_managed
+            service._remove_managed_radio_item = fake_remove
+
+            preview = await service.remove_all_managed_radios(dry_run=True)
+            assert preview["target_count"] == 2
+            assert preview["removed_count"] == 0
+            assert preview["failed_count"] == 0
+            assert removed_ids == []
+
+            result = await service.remove_all_managed_radios(dry_run=False)
+            assert result["target_count"] == 2
+            assert result["removed_count"] == 2
+            assert result["failed_count"] == 0
+            assert removed_ids == ["11", "12"]
+        finally:
+            app.MA_MANAGED_URL_PREFIX = old_prefix
+
+    asyncio.run(run())
