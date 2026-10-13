@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.3**
+Current release: **v5.6.4**
 
 ## Features
 
@@ -26,6 +26,7 @@ Current release: **v5.6.3**
 - Bounded cold-start acquisition so failed sources release scarce upstream slots
 - Music Assistant per-radio audit endpoint for stale AAC/MP3, duplicate, missing, and source-removed entries
 - Safe dry-run and bulk removal endpoint for bridge-managed Music Assistant radios
+- Live playback priority over Music Assistant background warmups
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
@@ -331,6 +332,12 @@ v5.6.1 prevents a source that repeatedly returns HTTP errors from occupying one 
 After first real audio is established, FFmpeg still owns normal reconnect behavior.
 
 After a Music Assistant add/update finishes its release-grace window, a listener-free import-only warmup hub is released immediately instead of entering the normal 30-second playback linger. This keeps serial catalog syncs from consuming both upstream slots with completed imports.
+
+### v5.6.4 playback priority
+
+Live stream listeners now take priority over Music Assistant catalog warmups. The bridge will not start a new MA warmup while any stream listener is active. If playback begins while an unrelated MA warmup is still waiting for real audio, that warmup is released immediately and resumes after playback becomes idle. The MA release-grace period also ends early when playback becomes active.
+
+`/streams` now reports `playback_priority_active`, `playback_listeners`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
 
 ### v5.4 stream write smoothing
 
