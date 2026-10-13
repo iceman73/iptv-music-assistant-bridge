@@ -4,7 +4,7 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.2**
+Current release: **v5.6.3**
 
 ## Features
 
@@ -25,6 +25,7 @@ Current release: **v5.6.2**
 - Automatic AAC/MP3 format migration for bridge-managed Music Assistant stations
 - Bounded cold-start acquisition so failed sources release scarce upstream slots
 - Music Assistant per-radio audit endpoint for stale AAC/MP3, duplicate, missing, and source-removed entries
+- Safe dry-run and bulk removal endpoint for bridge-managed Music Assistant radios
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
 - FFmpeg/XC credential redaction in bridge logs
@@ -405,6 +406,20 @@ curl http://YOUR-BRIDGE-HOST:8088/ma/radios
 
 The summary counts and per-radio `status` fields make stale AAC entries and duplicates visible without relying on aggregate sync counters.
 
+Preview a full bridge-managed cleanup without deleting anything:
+
+```bash
+curl http://YOUR-BRIDGE-HOST:8088/ma/radios/remove-all
+```
+
+Remove all bridge-managed MA radio objects:
+
+```bash
+curl -X POST 'http://YOUR-BRIDGE-HOST:8088/ma/radios/remove-all?dry_run=false'
+```
+
+Only radios whose Builtin provider URL begins with `MA_MANAGED_URL_PREFIX` are targeted. Unrelated Music Assistant radio stations are left untouched.
+
 Alternatively, Music Assistant can consume the generated playlist:
 
 ```text
@@ -428,6 +443,8 @@ http://YOUR-BRIDGE-HOST:8088/playlist.m3u8
 | POST | `/catalog/refresh` | Force a catalog refresh |
 | GET | `/ma/status` | Music Assistant synchronization status |
 | GET | `/ma/radios` | Audit actual bridge-managed Music Assistant radio URLs and migration state |
+| GET | `/ma/radios/remove-all` | Preview all bridge-managed MA radios that would be removed |
+| POST | `/ma/radios/remove-all?dry_run=false` | Remove all bridge-managed MA radios; unrelated radios are untouched |
 | POST | `/ma/sync` | Force Music Assistant synchronization |
 | GET | `/api/checks` | Run dependency/API diagnostics |
 | POST | `/api/checks/run` | Force dependency/API diagnostics |
