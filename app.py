@@ -40,7 +40,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.10")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.11")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -111,8 +111,8 @@ STARTUP_REAL_AUDIO_RETRIES = max(1, int(os.getenv("STARTUP_REAL_AUDIO_RETRIES", 
 STARTUP_REAL_AUDIO_RETRY_DELAY = max(0.0, float(os.getenv("STARTUP_REAL_AUDIO_RETRY_DELAY", "2")))
 POST_START_GAP_FILL_ENABLED = os.getenv("POST_START_GAP_FILL_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 POST_START_GAP_FILL_AFTER_SECONDS = max(0.25, float(os.getenv("POST_START_GAP_FILL_AFTER_SECONDS", "0.75")))
-STREAM_JITTER_BUFFER_ENABLED = os.getenv("STREAM_JITTER_BUFFER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-STREAM_JITTER_BUFFER_ADAPTIVE = os.getenv("STREAM_JITTER_BUFFER_ADAPTIVE", "true").strip().lower() in {"1", "true", "yes", "on"}
+STREAM_JITTER_BUFFER_ENABLED = os.getenv("STREAM_JITTER_BUFFER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+STREAM_JITTER_BUFFER_ADAPTIVE = os.getenv("STREAM_JITTER_BUFFER_ADAPTIVE", "false").strip().lower() in {"1", "true", "yes", "on"}
 STREAM_JITTER_BUFFER_SECONDS = max(0.0, float(os.getenv("STREAM_JITTER_BUFFER_SECONDS", "8.0")))
 STREAM_JITTER_BUFFER_MIN_SECONDS = max(0.0, float(os.getenv("STREAM_JITTER_BUFFER_MIN_SECONDS", "4.0")))
 STREAM_JITTER_BUFFER_MAX_SECONDS = max(
@@ -146,7 +146,7 @@ STREAM_READ_CHUNK_BYTES = max(1024, int(os.getenv("STREAM_READ_CHUNK_BYTES", "16
 # write granularity. A short max delay prevents extra latency on low-bitrate streams.
 STREAM_COALESCE_BYTES = max(0, int(os.getenv("STREAM_COALESCE_BYTES", "8192")))
 STREAM_COALESCE_MAX_SECONDS = max(0.0, float(os.getenv("STREAM_COALESCE_MAX_SECONDS", "0.50")))
-STREAM_OUTPUT_PACING = os.getenv("STREAM_OUTPUT_PACING", "true").strip().lower() in {"1", "true", "yes", "on"}
+STREAM_OUTPUT_PACING = os.getenv("STREAM_OUTPUT_PACING", "false").strip().lower() in {"1", "true", "yes", "on"}
 STREAM_OUTPUT_PACING_SLACK_SECONDS = max(0.0, float(os.getenv("STREAM_OUTPUT_PACING_SLACK_SECONDS", "0.25")))
 STREAM_RING_BUFFER_SECONDS = max(0.0, float(os.getenv("STREAM_RING_BUFFER_SECONDS", "0.5")))
 UPSTREAM_RETRY_INITIAL_SECONDS = max(0.25, float(os.getenv("UPSTREAM_RETRY_INITIAL_SECONDS", "1")))
@@ -3253,7 +3253,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.10",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.11",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,

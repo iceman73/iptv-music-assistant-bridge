@@ -4,7 +4,9 @@ A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio cha
 
 The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
 
-Current release: **v5.6.10**
+Current release: **v5.6.11**
+
+v5.6.11 simplifies the default playback path for Amazon Echo: persistent FFmpeg output is still coalesced into ~8 KB writes, but output pacing and the adaptive jitter buffer are now disabled by default. Both remain available as opt-in diagnostics/tuning controls.
 
 ## Features
 
@@ -27,9 +29,9 @@ Current release: **v5.6.10**
 - Music Assistant per-radio audit endpoint for stale AAC/MP3, duplicate, missing, and source-removed entries
 - Safe dry-run and bulk removal endpoint for bridge-managed Music Assistant radios
 - Live playback priority over Music Assistant background warmups
-- Real-time MP3 output pacing to smooth burst-delivered sources
+- Optional MP3 output pacing for troubleshooting unusually bursty sources; disabled by default for Echo playback
 - Shorter reconnect pre-roll to reduce audible repeats
-- Adaptive per-channel jitter buffering to smooth bursty upstream delivery before realtime pacing
+- Optional adaptive per-channel jitter buffering; disabled by default so MP3 follows the simpler FFmpeg → coalescer → HTTP path
 - Post-start gap fill is disabled by default because separately encoded silence can upset Echo playback
 - Persistent channel catalog cache
 - Health, stream and dependency diagnostics
@@ -226,15 +228,9 @@ STREAM_SUBSCRIBER_QUEUE_CHUNKS=16
 STREAM_READ_CHUNK_BYTES=16384
 STREAM_COALESCE_BYTES=8192
 STREAM_COALESCE_MAX_SECONDS=0.50
-STREAM_OUTPUT_PACING=true
+STREAM_OUTPUT_PACING=false
 STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
-STREAM_JITTER_BUFFER_ENABLED=true
-STREAM_JITTER_BUFFER_SECONDS=2.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
-STREAM_RING_BUFFER_SECONDS=0.5
-STREAM_OUTPUT_PACING=true
-STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
-STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_ENABLED=false
 STREAM_JITTER_BUFFER_SECONDS=2.0
 STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
 STREAM_RING_BUFFER_SECONDS=0.5
@@ -279,10 +275,10 @@ MA_REMOVE_MISSING=false
 | `STREAM_READ_CHUNK_BYTES` | `16384` | Maximum FFmpeg pipe read request; actual reads may be much smaller |
 | `STREAM_COALESCE_BYTES` | `8192` | Coalesce small encoded reads into steadier client writes; `0` disables |
 | `STREAM_COALESCE_MAX_SECONDS` | `0.50` | Maximum time to hold a partial coalesced write |
-| `STREAM_OUTPUT_PACING` | `true` | Pace MP3 delivery at the configured bitrate instead of forwarding upstream bursts |
+| `STREAM_OUTPUT_PACING` | `false` | Optional MP3 bitrate pacing; disabled by default so clients receive coalesced FFmpeg output directly |
 | `STREAM_OUTPUT_PACING_SLACK_SECONDS` | `0.25` | Reset pacing after a real upstream gap instead of catching up with a burst |
-| `STREAM_JITTER_BUFFER_ENABLED` | `true` | Buffer encoded MP3 ahead of playback to absorb short upstream delivery gaps |
-| `STREAM_JITTER_BUFFER_ADAPTIVE` | `true` | Learn a working reserve independently for each active channel |
+| `STREAM_JITTER_BUFFER_ENABLED` | `false` | Optional encoded MP3 reserve; disabled by default for the simpler Echo-safe playback path |
+| `STREAM_JITTER_BUFFER_ADAPTIVE` | `false` | Optional per-channel reserve learning; only relevant when jitter buffering is enabled |
 | `STREAM_JITTER_BUFFER_MIN_SECONDS` | `4.0` | Lowest learned reserve target |
 | `STREAM_JITTER_BUFFER_LOW_WATER_SECONDS` | `2.0` | Raise the learned target before the current reserve reaches zero |
 | `STREAM_JITTER_BUFFER_INCREASE_SECONDS` | `2.0` | Increase the learned channel target after a low-water event or underrun |
@@ -368,9 +364,9 @@ Live stream listeners now take priority over Music Assistant catalog warmups. Th
 
 `/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
 
-### v5.6.10 proactive Echo jitter learning
+### v5.6.11 proactive Echo jitter learning
 
-v5.6.10 changes adaptive buffering so the bridge no longer waits for an actual underrun before learning that a station needs more reserve. A new station starts at 8 seconds. When the live reserve falls to the 2-second low-water mark, the bridge immediately raises and persists that channel's learned target by 2 seconds for the next clean tune or source reacquisition, up to 20 seconds.
+v5.6.11 changes adaptive buffering so the bridge no longer waits for an actual underrun before learning that a station needs more reserve. A new station starts at 8 seconds. When the live reserve falls to the 2-second low-water mark, the bridge immediately raises and persists that channel's learned target by 2 seconds for the next clean tune or source reacquisition, up to 20 seconds.
 
 Learned targets are stored in `/data/jitter-targets.json` by default, so Classic Vinyl, 80s on 8, and other channels can retain different reserve requirements across hub recreation and container restart.
 
@@ -388,8 +384,8 @@ jitter_buffer_corruption_risk
 Recommended Echo defaults:
 
 ```env
-STREAM_JITTER_BUFFER_ENABLED=true
-STREAM_JITTER_BUFFER_ADAPTIVE=true
+STREAM_JITTER_BUFFER_ENABLED=false
+STREAM_JITTER_BUFFER_ADAPTIVE=false
 STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
 STREAM_JITTER_BUFFER_SECONDS=8.0
 STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
@@ -408,8 +404,8 @@ v5.6.9 makes the MP3 reserve adaptive per active channel. Each hub starts from i
 Default behavior:
 
 ```env
-STREAM_JITTER_BUFFER_ENABLED=true
-STREAM_JITTER_BUFFER_ADAPTIVE=true
+STREAM_JITTER_BUFFER_ENABLED=false
+STREAM_JITTER_BUFFER_ADAPTIVE=false
 STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
 STREAM_JITTER_BUFFER_SECONDS=8.0
 STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
@@ -432,8 +428,8 @@ v5.6.8 adds a small encoded-MP3 jitter buffer ahead of the existing 192 kbps pac
 Defaults:
 
 ```env
-STREAM_JITTER_BUFFER_ENABLED=true
-STREAM_JITTER_BUFFER_ADAPTIVE=true
+STREAM_JITTER_BUFFER_ENABLED=false
+STREAM_JITTER_BUFFER_ADAPTIVE=false
 STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
 STREAM_JITTER_BUFFER_SECONDS=8.0
 STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
@@ -469,9 +465,9 @@ Recommended Echo-facing values:
 
 ```env
 MP3_BITRATE=192k
-STREAM_OUTPUT_PACING=true
+STREAM_OUTPUT_PACING=false
 STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
-STREAM_JITTER_BUFFER_ENABLED=true
+STREAM_JITTER_BUFFER_ENABLED=false
 STREAM_JITTER_BUFFER_SECONDS=2.0
 STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
 STREAM_RING_BUFFER_SECONDS=0.5
