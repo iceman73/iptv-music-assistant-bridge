@@ -946,6 +946,24 @@ class SharedStreamHub:
             except asyncio.CancelledError:
                 pass
 
+    async def preempt_warmup_for_playback(self) -> bool:
+        """Stop a listener-free pinned warmup immediately so playback gets capacity."""
+        async with self.lock:
+            if self.subscribers or self.pins <= 0:
+                return False
+            task = self.task
+            if task is None or task.done():
+                return False
+            self._cancel_linger_locked()
+            self.state = "preempted_for_playback"
+        LOGGER.info("Preempting MA warmup hub %s for live playback", self.key)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return True
+
     async def restart_failed_warmup(self) -> bool:
         """Restart a pinned warmup only when doing so cannot disrupt a listener."""
         async with self.lock:
@@ -1047,6 +1065,7 @@ class StreamManager:
         self.playback_idle_event = asyncio.Event()
         self.playback_idle_event.set()
         self.playback_listeners = 0
+        self.ma_warmups_preempted = 0
 
     async def _hub(self, channel: Channel, fmt: str) -> SharedStreamHub:
         key = f"{channel.channel_id}:{fmt}"
@@ -1098,12 +1117,25 @@ class StreamManager:
                     task.cancel()
             await asyncio.gather(audio_task, playback_task, return_exceptions=True)
 
+    async def _preempt_other_warmups(self, exclude_key: str) -> None:
+        async with self.lock:
+            hubs = [hub for key, hub in self.hubs.items() if key != exclude_key]
+        results = await asyncio.gather(
+            *(hub.preempt_warmup_for_playback() for hub in hubs),
+            return_exceptions=True,
+        )
+        self.ma_warmups_preempted += sum(result is True for result in results)
+
     async def subscribe(self, channel: Channel, fmt: str) -> AsyncIterator[bytes]:
         # Any HTTP stream consumer is treated as playback demand. This includes
         # MA's short validation connection, which is exactly when source capacity
         # must favor the listener rather than an unrelated background warmup.
         await self._listener_joined()
         hub = await self._hub(channel, fmt)
+        # If an unrelated MA warmup currently owns an upstream slot, cancel its
+        # FFmpeg immediately. Its hold_warm context will observe playback demand,
+        # release the pin, and retry after playback goes idle.
+        await self._preempt_other_warmups(hub.key)
         try:
             async for chunk in hub.subscribe():
                 yield chunk
@@ -1192,6 +1224,7 @@ class StreamManager:
             "pins": sum(row["pins"] for row in rows),
             "playback_priority_active": self.playback_active_event.is_set(),
             "playback_listeners": self.playback_listeners,
+            "ma_warmups_preempted": self.ma_warmups_preempted,
             "linger_seconds": STREAM_LINGER_SECONDS,
             "hubs": rows,
         }
