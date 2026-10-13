@@ -13,7 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py import_to_ma.py ./
+COPY app.py ./
 
 RUN mkdir -p /data && chown -R bridge:bridge /app /data
 

@@ -6,7 +6,7 @@ Thanks for contributing to IPTV Music Assistant Bridge.
 
 1. Fork the repository and create a branch from `main`.
 2. Make the smallest focused change that solves the problem.
-3. Preserve the v5 shared-hub playback model unless the change is intentionally architectural.
+3. Preserve the v6 FFmpeg-readrate shared-hub playback model unless the change is intentionally architectural.
 4. Do not commit credentials, tokens, passwords, provider URLs containing secrets, or a real `.env` file.
 5. Update documentation when configuration, behavior, or API endpoints change.
 6. Add or update tests for functional changes.
@@ -46,7 +46,7 @@ startup silence, subscriber queues, ICY metadata, or Music Assistant import
 behavior should avoid creating unnecessary upstream connections or FFmpeg
 respawns.
 
-Keep configuration backward compatible where practical. New environment
+Do not reintroduce the retired v5 Python pacing, adaptive jitter, or post-start gap-fill paths without measured evidence. Keep configuration backward compatible where practical. New environment
 variables should have safe defaults and should be documented in both
 `.env.example` and `README.md`.
 

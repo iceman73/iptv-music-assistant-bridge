@@ -1,704 +1,486 @@
 # IPTV Music Assistant Bridge
 
-A lightweight Docker bridge that turns Dispatcharr / Xtream Codes IPTV audio channels into radio streams that Music Assistant can use reliably, with MP3 defaults selected for improved Amazon Echo compatibility.
+A Docker bridge that turns Dispatcharr or Xtream Codes audio channels into stable radio streams for Music Assistant. The default path is tuned for Amazon Echo playback.
 
-The bridge is designed for audio-only IPTV channels such as SiriusXM. It keeps a small number of upstream Dispatcharr connections open, converts or remuxes the source with FFmpeg, exposes AAC and MP3 radio URLs, adds optional now-playing metadata, and can synchronize the resulting stations into Music Assistant automatically.
+**Current release: v6.0.0**
 
-Current release: **v5.6.13**
+v6 is a cleanup release based on the playback path validated in v5.6.13. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, and post-start silence gap-fill experiments have been removed. FFmpeg now owns media timing and reconnect behavior.
 
-v5.6.13 keeps the Echo-safe Python path simple and adds FFmpeg `-readrate 1` before the live MPEG-TS input. FFmpeg now consumes the timestamped source at media rate before MP3 encoding, while Python output pacing and jitter buffering remain disabled. Gap diagnostics now include the current in-progress gap and effective maximum gap.
+## Architecture
 
-## Features
+```text
+Dispatcharr / XC MPEG-TS
+        ↓
+Persistent FFmpeg
+  reconnect + -readrate 1
+        ↓
+MP3 192k by default
+        ↓
+8 KB coalescer
+500 ms hard flush deadline
+        ↓
+Shared station hub
+        ↓
+Music Assistant
+        ↓
+Echo / other players
+```
 
-- Dispatcharr M3U or Xtream Codes / XC source support
-- AAC and MP3 radio endpoints for Music Assistant
-- MP3 is the default output/import format for improved Amazon Echo compatibility
-- Shared upstream stream per channel and format
-- FFmpeg media-time input pacing (`-readrate 1`) plus coalesced 8 KB client writes
-- Configurable upstream connection limit
-- 30-second hot-stream linger to avoid unnecessary reconnects
-- Startup silence while a cold IPTV stream opens
-- AAC copy mode when Dispatcharr already provides AAC
-- Optional SiriusXM now-playing metadata
-- Ticker-compatible free SiriusXM metadata source
-- xmplaylist fallback
-- Optional ICY artist/title injection
-- Automatic Music Assistant radio synchronization
-- Automatic AAC/MP3 format migration for bridge-managed Music Assistant stations
-- Bounded cold-start acquisition so failed sources release scarce upstream slots
-- Music Assistant per-radio audit endpoint for stale AAC/MP3, duplicate, missing, and source-removed entries
-- Safe dry-run and bulk removal endpoint for bridge-managed Music Assistant radios
-- Live playback priority over Music Assistant background warmups
-- Optional MP3 output pacing for troubleshooting unusually bursty sources; disabled by default for Echo playback
-- Shorter reconnect pre-roll to reduce audible repeats
-- Optional adaptive per-channel jitter buffering; disabled by default so MP3 follows the simpler FFmpeg → coalescer → HTTP path
-- Post-start gap fill is disabled by default because separately encoded silence can upset Echo playback
-- Persistent channel catalog cache
-- Health, stream and dependency diagnostics, including real-audio chunk-gap timing
-- FFmpeg/XC credential redaction in bridge logs
+FFmpeg consumes the timestamped MPEG-TS source at media rate before encoding MP3. The Python bridge does not pace encoded MP3 bytes and does not inject silence after real playback has started.
+
+## What v6 keeps
+
+- Dispatcharr M3U and Xtream Codes / XC source support
+- MP3 and AAC stream endpoints
+- MP3 192 kbps default for Echo compatibility
+- Persistent FFmpeg per active channel
+- FFmpeg reconnect handling
+- FFmpeg `-readrate 1` input pacing
+- Shared channel/format hubs
+- 8 KB write coalescing with a real 500 ms timer
+- 30-second hot-stream linger
+- 0.5-second reconnect pre-roll ring buffer
+- Startup silence while a cold source opens
+- Live-playback priority over Music Assistant warmups
+- Native Music Assistant sync, migration, audit, and cleanup
+- Ticker metadata with xmplaylist fallback
+- Optional ICY metadata
+- Catalog persistence
+- Stream-gap and dependency diagnostics
+- Credential redaction in logs
+
+## Removed in v6
+
+These settings and code paths are intentionally gone:
+
+```text
+STREAM_OUTPUT_PACING
+STREAM_OUTPUT_PACING_SLACK_SECONDS
+STREAM_JITTER_BUFFER_*
+STREAM_JITTER_STATE_FILE
+POST_START_GAP_FILL_*
+UPSTREAM_RETRY_INITIAL_SECONDS
+UPSTREAM_RETRY_MAX_SECONDS
+UPSTREAM_RETRY_FOREVER_WHILE_LISTENING
+REAL_AUDIO_STALL_SECONDS
+STARTUP_SILENCE_MAX_SECONDS
+STARTUP_REAL_AUDIO_RETRIES
+STARTUP_REAL_AUDIO_RETRY_DELAY
+```
+
+The standalone `import_to_ma.py` v4-era importer is also removed. Music Assistant management is built into the bridge.
+
+Old variables left in an existing local `.env` are harmless, but they are ignored by v6. Cleaning them out is recommended.
 
 ## Requirements
 
 - Docker with Docker Compose
-- A working Dispatcharr instance
-- Music Assistant if you want automatic radio synchronization
+- Dispatcharr or an XC-compatible source
+- Music Assistant if you want automatic station management
 - FFmpeg is included in the container
 
-For the recommended configuration, Dispatcharr should output audio-only **AAC-LC, 128 kbps, 48 kHz, stereo**.
+The recommended Dispatcharr source is audio-only AAC-LC, 128 kbps, 48 kHz, stereo in MPEG-TS.
 
-## Published Docker image
+## Published image
 
-Successful builds on `main` are published automatically to GitHub Container Registry:
+Successful builds from `main` publish:
 
 ```text
 ghcr.io/iceman73/iptv-music-assistant-bridge:latest
 ```
 
-Each published build also receives an immutable commit tag in the form:
+Each build also receives:
 
 ```text
 ghcr.io/iceman73/iptv-music-assistant-bridge:sha-<git-commit>
 ```
 
-Pull the current published image with:
-
-```bash
-docker pull ghcr.io/iceman73/iptv-music-assistant-bridge:latest
-```
-
-Pull requests are tested and built, but are not published.
-
-## Installation
-
-Clone the repository:
+## Install
 
 ```bash
 git clone https://github.com/iceman73/iptv-music-assistant-bridge.git
 cd iptv-music-assistant-bridge
-```
-
-Create your local environment file:
-
-```bash
 cp .env.example .env
-```
-
-Edit `.env` with your Dispatcharr/XC and Music Assistant settings, then build and start the container:
-
-```bash
 docker compose up -d --build
 ```
 
-Check that the bridge is running:
+For a deployment already using the published image:
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+Check the bridge:
 
 ```bash
 curl http://YOUR-BRIDGE-HOST:8088/health
+curl http://YOUR-BRIDGE-HOST:8088/streams
 ```
 
-The default bridge port is **8088**.
+## Recommended Dispatcharr audio profile
 
-The Docker Compose project explicitly names the local image:
+Use an audio-only profile similar to:
 
 ```text
-ghcr.io/iceman73/iptv-music-assistant-bridge:latest
+-user_agent {userAgent} -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -i {streamUrl} -vn -map 0:a:0 -c:a aac -b:a 128k -ar 48000 -ac 2 -probesize 1000000 -analyzeduration 2000000 -fflags +discardcorrupt+genpts -muxdelay 0 -muxpreload 0 -mpegts_flags +resend_headers+initial_discontinuity -f mpegts pipe:1
 ```
 
-The container name remains `dispatcharr-ma-bridge`.
-
-### Docker base image mirror
-
-The project defaults Docker builds to Google's Docker Hub mirror:
-
-```text
-mirror.gcr.io/library/python:3.12-slim
-```
-
-This avoids unnecessary failures when Docker Hub's authentication service is unavailable or rate-limited. The same default is used by local Docker Compose builds and GitHub Actions.
-
-If you explicitly want to use Docker Hub instead, override the build argument when starting the stack:
-
-```bash
-BASE_IMAGE=python:3.12-slim docker compose up -d --build
-```
-
-No change to your local `.env` is required for the mirror default.
-
-To update later:
-
-```bash
-git pull
-docker compose down
-docker compose up -d --build
-```
-
-## Dispatcharr configuration
-
-### Recommended audio-only stream profile
-
-Create a Dispatcharr stream profile named **audio_only** and use:
-
-```text
--user_agent {userAgent} -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -i {streamUrl} -vn -map 0:a:0 -c:a aac -b:a 128k -probesize 1000000 -analyzeduration 2000000 -fflags +discardcorrupt+genpts -muxdelay 0 -muxpreload 0 -mpegts_flags +resend_headers+initial_discontinuity -f mpegts pipe:1
-```
-
-This profile:
-
-- removes video
-- selects the first audio stream
-- outputs AAC at 128 kbps
-- normalizes to 48 kHz stereo
-- uses MPEG-TS for the Dispatcharr output
-- keeps the stream suitable for the bridge's `AAC_MODE=copy` path
-- lets FFmpeg reconnect across transient source interruptions while avoiding low-latency flags that can create gaps with burst-delivered audio
-
-If your provider is already stable AAC, this avoids an additional audio encode inside the bridge.
+The bridge then opens that MPEG-TS source with its own persistent FFmpeg process and adds `-readrate 1` before `-i`.
 
 ## Source configuration
 
-The bridge supports two source modes.
-
-### Option 1: Xtream Codes / XC
-
-This is the recommended setup when using Dispatcharr's XC-compatible endpoint.
+### Xtream Codes / XC
 
 ```env
 SOURCE_MODE=xc
-
 XC_BASE_URL=http://dispatcharr:9191
-XC_USERNAME=your-xc-username
-XC_PASSWORD=your-xc-password
+XC_USERNAME=your-user
+XC_PASSWORD=your-password
 XC_OUTPUT=ts
 XC_VERIFY_SSL=true
-
+XC_CATEGORY_IDS=
 GROUP_FILTER=SiriusXM
 NAME_FILTER=
-XC_CATEGORY_IDS=
 ```
 
-The bridge authenticates to `player_api.php`, loads live categories and streams, then creates the appropriate XC live-stream URL.
+The bridge reads XC categories and live streams, then builds the normal live-stream URL for each matching channel.
 
-### Option 2: Dispatcharr M3U
+### Dispatcharr M3U
 
 ```env
 SOURCE_MODE=dispatcharr
-
 DISPATCHARR_BASE_URL=http://dispatcharr:9191
 DISPATCHARR_M3U_PATH=/output/m3u
-DISPATCHARR_M3U_URL=
-
 GROUP_FILTER=SiriusXM
 NAME_FILTER=
 ```
 
-Set `DISPATCHARR_M3U_URL` if you want to use a complete custom M3U URL. Otherwise the bridge uses:
+You can use `DISPATCHARR_M3U_URL` instead of the base/path pair when needed.
 
-```text
-DISPATCHARR_BASE_URL + DISPATCHARR_M3U_PATH
-```
-
-## Minimum recommended configuration
-
-For an XC-based Dispatcharr installation with Music Assistant:
+## Minimum recommended v6 configuration
 
 ```env
-# Source
 SOURCE_MODE=xc
 XC_BASE_URL=http://dispatcharr:9191
-XC_USERNAME=your-xc-username
-XC_PASSWORD=your-xc-password
-XC_OUTPUT=ts
-XC_VERIFY_SSL=true
+XC_USERNAME=your-user
+XC_PASSWORD=your-password
 GROUP_FILTER=SiriusXM
 
-# Bridge
-PUBLIC_BASE_URL=http://YOUR-BRIDGE-HOST:8088
+PUBLIC_BASE_URL=http://bridge:8088
 DEFAULT_FORMAT=mp3
-IMPORT_FORMAT=mp3
+MP3_BITRATE=192k
 
-# Audio
-AAC_MODE=copy
-AAC_BITRATE=128k
-SAMPLE_RATE=48000
-CHANNELS=2
-
-# Shared stream behavior
 UPSTREAM_MAX_CONNECTIONS=2
 STREAM_LINGER_SECONDS=30
-STREAM_SUBSCRIBER_QUEUE_CHUNKS=16
-STREAM_READ_CHUNK_BYTES=16384
 STREAM_COALESCE_BYTES=8192
 STREAM_COALESCE_MAX_SECONDS=0.50
-STREAM_OUTPUT_PACING=false
-STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
-STREAM_JITTER_BUFFER_ENABLED=false
-STREAM_JITTER_BUFFER_SECONDS=2.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
 STREAM_RING_BUFFER_SECONDS=0.5
+STARTUP_SILENCE_ENABLED=true
 
-# Metadata
 METADATA_ENABLED=true
 METADATA_PROVIDER=ticker
 METADATA_FALLBACK=xmplaylist
-TICKER_ACTIVE_POLL_SECONDS=15
-TICKER_IDLE_POLL_SECONDS=0
 ICY_METADATA_ENABLED=true
-ICY_METAINT=16384
 
-# Music Assistant
 MUSIC_ASSISTANT_URL=http://music-assistant:8095
-MUSIC_ASSISTANT_TOKEN=YOUR_LONG_LIVED_TOKEN
+MUSIC_ASSISTANT_TOKEN=your-token
+IMPORT_FORMAT=mp3
 MA_AUTO_SYNC=true
 MA_SYNC_ON_START=true
-MA_SYNC_AFTER_CATALOG_REFRESH=true
-MA_REMOVE_MISSING=false
 ```
 
 ## Configuration reference
 
-### Bridge and audio
+### Audio and stream behavior
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PUBLIC_BASE_URL` | `http://localhost:8088` | URL Music Assistant uses to reach the bridge |
-| `DEFAULT_FORMAT` | `mp3` | Default playlist format: `mp3` for improved Amazon Echo compatibility; `aac` remains available |
-| `IMPORT_FORMAT` | same as default | Format imported into Music Assistant |
-| `AAC_MODE` | `auto` | `copy`, `auto`, or transcode behavior |
-| `AAC_BITRATE` | `128k` | AAC bitrate when transcoding |
+| `DEFAULT_FORMAT` | `mp3` | Default bridge format |
 | `MP3_BITRATE` | `192k` | MP3 output bitrate |
+| `AAC_BITRATE` | `128k` | AAC transcode bitrate |
+| `AAC_MODE` | `auto` | AAC copy/transcode behavior |
 | `SAMPLE_RATE` | `48000` | Output sample rate |
-| `CHANNELS` | `2` | Output audio channels |
-| `SOURCE_RW_TIMEOUT_SECONDS` | `60` | Upstream read timeout |
-| `UPSTREAM_STARTUP_TIMEOUT_SECONDS` | `30` | Maximum time an initial source attempt may wait for first real audio before it is recycled |
-| `UPSTREAM_MAX_CONNECTIONS` | `2` | Maximum simultaneous upstream streams |
-| `STREAM_LINGER_SECONDS` | `30` | Keep a hub hot after the final listener leaves |
-| `STREAM_SUBSCRIBER_QUEUE_CHUNKS` | `16` | Per-listener queue depth |
-| `STREAM_READ_CHUNK_BYTES` | `16384` | Maximum FFmpeg pipe read request; actual reads may be much smaller |
-| `STREAM_COALESCE_BYTES` | `8192` | Coalesce small encoded reads into steadier client writes; `0` disables |
-| `STREAM_COALESCE_MAX_SECONDS` | `0.50` | Maximum time to hold a partial coalesced write |
-| `STREAM_OUTPUT_PACING` | `false` | Optional MP3 bitrate pacing; disabled by default so clients receive coalesced FFmpeg output directly |
-| `STREAM_OUTPUT_PACING_SLACK_SECONDS` | `0.25` | Reset pacing after a real upstream gap instead of catching up with a burst |
-| `STREAM_JITTER_BUFFER_ENABLED` | `false` | Optional encoded MP3 reserve; disabled by default for the simpler Echo-safe playback path |
-| `STREAM_JITTER_BUFFER_ADAPTIVE` | `false` | Optional per-channel reserve learning; only relevant when jitter buffering is enabled |
-| `STREAM_JITTER_BUFFER_MIN_SECONDS` | `4.0` | Lowest learned reserve target |
-| `STREAM_JITTER_BUFFER_LOW_WATER_SECONDS` | `2.0` | Raise the learned target before the current reserve reaches zero |
-| `STREAM_JITTER_BUFFER_INCREASE_SECONDS` | `2.0` | Increase the learned channel target after a low-water event or underrun |
-| `STREAM_JITTER_STATE_FILE` | `/data/jitter-targets.json` | Persist learned per-channel targets across hub recreation and container restart |
-| `STREAM_JITTER_BUFFER_DECREASE_SECONDS` | `1.0` | Reduce the channel target by this amount after a stable period |
-| `STREAM_JITTER_BUFFER_STABLE_SECONDS` | `900` | Stable playback time required before reducing the learned target |
-| `STREAM_JITTER_BUFFER_SECONDS` | `8.0` | Initial MP3 reserve target for a channel without learned history |
-| `STREAM_JITTER_BUFFER_MAX_SECONDS` | `20.0` | Maximum learned encoded MP3 reserve for a bursty channel |
-| `STREAM_RING_BUFFER_SECONDS` | `0.5` | Short reconnect pre-roll; reduced to limit audible repeats |
-| `STARTUP_SILENCE_ENABLED` | `true` | Send valid silence while a cold source starts |
-| `STARTUP_SILENCE_MAX_SECONDS` | `60` | Maximum cold-start silence period |
-| `POST_START_GAP_FILL_ENABLED` | `false` | Optional post-start encoded-silence fill; disabled by default for Echo stability |
-| `POST_START_GAP_FILL_AFTER_SECONDS` | `0.75` | Start gap fill after this long without real source audio |
-| `FFMPEG_LOG_LEVEL` | `warning` | FFmpeg log verbosity |
+| `CHANNELS` | `2` | Stereo output |
+| `SOURCE_RW_TIMEOUT_SECONDS` | `60` | FFmpeg source read timeout |
+| `UPSTREAM_STARTUP_TIMEOUT_SECONDS` | `30` | Maximum cold-start wait for real audio |
+| `UPSTREAM_MAX_CONNECTIONS` | `2` | Maximum concurrent source FFmpeg sessions |
+| `STREAM_LINGER_SECONDS` | `30` | Keep an idle station hot briefly |
+| `STREAM_SUBSCRIBER_QUEUE_CHUNKS` | `16` | Per-client queue capacity |
+| `STREAM_RESTART_DELAY` | `1` | Delay before respawning exited FFmpeg |
+| `STREAM_READ_CHUNK_BYTES` | `16384` | FFmpeg stdout read size |
+| `STREAM_COALESCE_BYTES` | `8192` | Preferred downstream write size |
+| `STREAM_COALESCE_MAX_SECONDS` | `0.50` | Hard deadline for a partial coalesced write |
+| `STREAM_RING_BUFFER_SECONDS` | `0.5` | Short pre-roll for reconnecting clients |
+| `STARTUP_SILENCE_ENABLED` | `true` | Feed valid audio while a cold source opens |
 
-### Catalog and filtering
+`-readrate 1` is part of the v6 FFmpeg command and is not an environment switch.
+
+### Catalog
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GROUP_FILTER` | empty | Only include groups containing this text |
-| `NAME_FILTER` | empty | Only include channel names containing this text |
-| `XC_CATEGORY_IDS` | empty | Optional comma-separated XC category IDs |
-| `CATALOG_REFRESH_SECONDS` | `86400` | Normal catalog refresh interval |
-| `CATALOG_RETRY_SECONDS` | `3600` | Retry interval after a failed refresh |
-| `BRIDGE_CACHE_FILE` | `/data/bridge-cache.json` | Persistent last-known-good catalog |
+| `CATALOG_REFRESH_SECONDS` | `86400` | Normal source-catalog refresh |
+| `CATALOG_RETRY_SECONDS` | `3600` | Retry delay after refresh failure |
+| `GROUP_FILTER` | empty | Regex filter for source group |
+| `NAME_FILTER` | empty | Regex filter for channel name |
 
-### SiriusXM metadata
+The bridge stores its persistent cache at `/data/bridge-cache.json`.
+
+### Metadata
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `METADATA_ENABLED` | `true` | Enable now-playing collection |
-| `METADATA_PROVIDER` | `auto` | Metadata provider; recommended value is `ticker` |
-| `METADATA_FALLBACK` | `xmplaylist` | Fallback provider |
-| `TICKER_NOWPLAYING_URL` | StellarTunerLog bulk feed | Current SiriusXM now-playing feed |
-| `TICKER_CHANNEL_URL` | StellarTunerLog channel feed | SiriusXM channel mapping |
-| `TICKER_ACTIVE_POLL_SECONDS` | `15` | Poll interval while a bridge stream is active |
-| `TICKER_IDLE_POLL_SECONDS` | `0` | Idle polling; `0` disables it |
-| `TICKER_CHANNEL_REFRESH_SECONDS` | `86400` | Channel-map refresh interval |
-| `XMPLAYLIST_POLL_SECONDS` | `120` | xmplaylist fallback polling interval |
-| `ICY_METADATA_ENABLED` | `true` | Inject artist/title into clients requesting ICY metadata |
+| `METADATA_ENABLED` | `true` | Enable now-playing metadata |
+| `METADATA_PROVIDER` | `auto` | `ticker`, `xmplaylist`, `stellar`, or automatic selection |
+| `METADATA_FALLBACK` | `xmplaylist` | Fallback when Ticker fails |
+| `ICY_METADATA_ENABLED` | `true` | Inject ICY metadata for clients that request it |
 | `ICY_METAINT` | `16384` | Audio bytes between ICY metadata blocks |
-
-Ticker/xmplaylist lookups run outside the audio-delivery loop. v5.3 prebuilds the ICY metadata block and only inserts cached bytes into the stream.
-
-For troubleshooting, you can disable in-band metadata without disabling metadata collection:
-
-```env
-ICY_METADATA_ENABLED=false
-```
+| `TICKER_ACTIVE_POLL_SECONDS` | `15` | Poll rate while bridge streams are active |
+| `TICKER_IDLE_POLL_SECONDS` | `0` | Ticker polling while no bridge stream is active |
+| `XMPLAYLIST_POLL_SECONDS` | `120` | xmplaylist refresh interval |
 
 ### Music Assistant
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MUSIC_ASSISTANT_URL` | `http://music-assistant:8095` | Music Assistant API URL |
-| `MUSIC_ASSISTANT_TOKEN` | empty | Long-lived MA bearer token |
-| `IMPORT_LOGOS` | `true` | Import channel artwork |
-| `MA_AUTO_SYNC` | `false` | Enable automatic MA radio synchronization |
+| `MUSIC_ASSISTANT_URL` | `http://music-assistant:8095` | MA server |
+| `MUSIC_ASSISTANT_TOKEN` | empty | MA API token |
+| `IMPORT_FORMAT` | default format | Format used for managed radios |
+| `IMPORT_LOGOS` | `true` | Add source artwork/logo |
+| `MA_AUTO_SYNC` | `false` | Enable automatic synchronization |
 | `MA_SYNC_ON_START` | `true` | Sync after bridge startup |
-| `MA_SYNC_AFTER_CATALOG_REFRESH` | `true` | Sync after catalog refresh |
-| `MA_REMOVE_MISSING` | `false` | Remove bridge-managed stations no longer in the source |
+| `MA_SYNC_AFTER_CATALOG_REFRESH` | `true` | Sync after catalog changes |
+| `MA_REMOVE_MISSING` | `false` | Remove bridge-managed stations no longer in source |
+| `MA_SYNC_RETRY_SECONDS` | `3600` | Retry interval after failed sync |
 | `MA_SYNC_TIMEOUT` | `90` | MA API timeout |
-| `MA_ADD_RETRIES` | `3` | Add-radio retry count |
-| `MA_SYNC_CONCURRENCY` | `1` | Number of stations imported concurrently |
-| `STREAM_WARMUP_ENABLED` | `true` | Warm new streams before MA validates them |
-| `STREAM_WARMUP_RETRIES` | `2` | Cold-start warmup attempts before MA reports a failure and frees the hub immediately |
-| `STREAM_WARMUP_TIMEOUT` | `45` | Maximum wait per MA warmup attempt for real audio |
-| `MA_IMPORT_RELEASE_GRACE_SECONDS` | `11` | Keep a stream pinned briefly after MA accepts it |
+| `MA_ADD_RETRIES` | `3` | Retry station creation |
+| `MA_ADD_RETRY_DELAY` | `3` | Delay between station-add retries |
+| `MA_SYNC_CONCURRENCY` | `1` | Parallel MA station work |
+| `MA_IMPORT_RELEASE_GRACE_SECONDS` | `11` | Grace period after warm source release |
 
-### v5.6.1 cold-start recovery
+The bridge identifies its own MA radios by the managed bridge URL. Format changes such as AAC to MP3 migrate the same channel rather than leaving an old managed station behind.
 
-v5.6.1 prevents a source that repeatedly returns HTTP errors from occupying one of the limited upstream connection slots indefinitely during initial acquisition. Before first real audio, each source attempt is bounded by `UPSTREAM_STARTUP_TIMEOUT_SECONDS`. Music Assistant warmups retry according to `STREAM_WARMUP_RETRIES`, and a final warmup timeout immediately tears down an unused cold-start hub rather than leaving it in the normal linger window.
+## Music Assistant workflow
 
-`/streams` now separates current-attempt diagnostics from lifetime counters and reports `state`, `waiting_for_upstream_slot`, `current_attempt_number`, `current_attempt_started_at`, `current_attempt_http_503_count`, and `current_attempt_http_error_count`. Current-attempt timestamps and the encoded ring buffer are reset when a new upstream attempt starts, so stale audio and historical timestamps do not appear as current data.
+Automatic synchronization can:
 
-After first real audio is established, FFmpeg still owns normal reconnect behavior.
+- add missing bridge stations
+- skip unchanged stations
+- migrate a managed station when its URL format changes
+- remove stale formats
+- optionally remove source channels that no longer exist
+- warm a stream before MA probes it
+- yield upstream capacity to real playback
 
-After a Music Assistant add/update finishes its release-grace window, a listener-free import-only warmup hub is released immediately instead of entering the normal 30-second playback linger. This keeps serial catalog syncs from consuming both upstream slots with completed imports.
-
-### v5.6.4 playback priority
-
-Live stream listeners now take priority over Music Assistant catalog warmups. The bridge will not start a new MA warmup while any stream listener is active. If playback begins while an unrelated MA warmup owns an upstream slot, that warmup's FFmpeg process is cancelled immediately, its pin is released, and the import resumes after playback becomes idle. The MA release-grace period also ends early when playback becomes active.
-
-`/streams` now reports `playback_priority_active`, `playback_listeners`, `ma_warmups_preempted`, and a per-hub `demand_type` of `playback`, `ma_warmup`, or `linger`. This makes it clear whether scarce upstream capacity is being used for a real listener or background catalog work.
-
-### v5.6.13 proactive Echo jitter learning
-
-v5.6.13 changes adaptive buffering so the bridge no longer waits for an actual underrun before learning that a station needs more reserve. A new station starts at 8 seconds. When the live reserve falls to the 2-second low-water mark, the bridge immediately raises and persists that channel's learned target by 2 seconds for the next clean tune or source reacquisition, up to 20 seconds.
-
-Learned targets are stored in `/data/jitter-targets.json` by default, so Classic Vinyl, 80s on 8, and other channels can retain different reserve requirements across hub recreation and container restart.
-
-An actual underrun is still recorded, but is now flagged as `jitter_buffer_corruption_risk=true` because Echo playback may remain stuttery/static after the stream reaches zero even when the bridge later refills.
-
-`/streams` adds:
+Useful endpoints:
 
 ```text
-jitter_buffer_low_water_seconds
-jitter_buffer_low_water_events
-jitter_buffer_target_persisted
-jitter_buffer_corruption_risk
+/ma/status
+/ma/sync
+/ma/audit
 ```
 
-Recommended Echo defaults:
+Use the audit/cleanup endpoints before bulk removals. The bridge only manages radios whose URL matches its configured managed URL prefix.
 
-```env
-STREAM_JITTER_BUFFER_ENABLED=false
-STREAM_JITTER_BUFFER_ADAPTIVE=false
-STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
-STREAM_JITTER_BUFFER_SECONDS=8.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
-STREAM_JITTER_BUFFER_LOW_WATER_SECONDS=2.0
-STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
-STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
-STREAM_JITTER_BUFFER_STABLE_SECONDS=900
-STREAM_JITTER_STATE_FILE=/data/jitter-targets.json
-POST_START_GAP_FILL_ENABLED=false
-```
-
-### v5.6.9 adaptive per-channel jitter buffer
-
-v5.6.9 makes the MP3 reserve adaptive per active channel. Each hub starts from its persisted learned target, raises that target proactively when the live reserve crosses the low-water threshold, and slowly backs the target down after sustained stable playback. This lets steadier stations run with less latency while burstier stations learn that they need more protection before an Echo-facing stream actually underruns.
-
-Default behavior:
-
-```env
-STREAM_JITTER_BUFFER_ENABLED=false
-STREAM_JITTER_BUFFER_ADAPTIVE=false
-STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
-STREAM_JITTER_BUFFER_SECONDS=8.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
-STREAM_JITTER_BUFFER_LOW_WATER_SECONDS=2.0
-STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
-STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
-STREAM_JITTER_BUFFER_STABLE_SECONDS=900
-STREAM_JITTER_STATE_FILE=/data/jitter-targets.json
-POST_START_GAP_FILL_ENABLED=false
-```
-
-A channel starts at 4 seconds. Each underrun raises its working target by 2 seconds, up to 16 seconds. After 10 minutes without an underrun, the target drops by 1 second, no lower than 2 seconds. The learned target stays with the active hub across source reacquisition attempts.
-
-`/streams` now reports `jitter_buffer_adaptive_target_seconds`, `jitter_buffer_target_increases`, and `jitter_buffer_target_decreases` in addition to the existing jitter diagnostics.
-
-### v5.6.8 MP3 jitter buffer
-
-v5.6.8 adds a small encoded-MP3 jitter buffer ahead of the existing 192 kbps pacing stage. The bridge now reads bursty FFmpeg output into a reserve, then drains that reserve at the configured MP3 bitrate. This absorbs short source-delivery pauses without splicing a second MP3 encoder into the live stream.
-
-Defaults:
-
-```env
-STREAM_JITTER_BUFFER_ENABLED=false
-STREAM_JITTER_BUFFER_ADAPTIVE=false
-STREAM_JITTER_BUFFER_MIN_SECONDS=4.0
-STREAM_JITTER_BUFFER_SECONDS=8.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=20.0
-STREAM_JITTER_BUFFER_LOW_WATER_SECONDS=2.0
-STREAM_JITTER_BUFFER_INCREASE_SECONDS=2.0
-STREAM_JITTER_BUFFER_DECREASE_SECONDS=1.0
-STREAM_JITTER_BUFFER_STABLE_SECONDS=900
-STREAM_JITTER_STATE_FILE=/data/jitter-targets.json
-POST_START_GAP_FILL_ENABLED=false
-```
-
-The 2-second reserve adds roughly two seconds to initial real-audio startup, but it is designed to prevent short Dispatcharr/XC starvation periods from becoming audible skips on Echo devices. If the buffer is fully exhausted, the bridge re-primes instead of repeatedly starting and stopping on tiny bursts.
-
-`/streams` reports `jitter_buffer_current_seconds`, `jitter_buffer_max_observed_seconds`, `jitter_buffer_primed`, and `jitter_buffer_underruns` for validation.
-
-### v5.6.6 post-start gap fill
-
-Echo playback can remain connected while the IPTV source temporarily stops producing audio, then resume with static or jumpy decoder state. v5.6.6 keeps the same downstream HTTP stream alive with valid realtime encoded silence whenever real audio stalls for more than `POST_START_GAP_FILL_AFTER_SECONDS` (default 0.75 seconds). When source audio resumes, the bridge switches back without restarting the client.
-
-The MP3 muxer also disables Xing and ID3v2 headers so switching between the real encoder and the silence encoder does not insert metadata/header blocks in the middle of an active MP3 stream.
-
-`/streams` now reports `gap_fill_enabled`, `gap_fill_after_seconds`, `gap_fill_active`, `gap_fill_events`, and `gap_fill_seconds`.
-
-### v5.6.5 MP3 pacing and reconnect smoothing
-
-v5.6.5 adds real-time pacing for the MP3 path. Some IPTV sources deliver several seconds of audio in a burst and then pause. Browsers tolerate that well, but Music Assistant and Echo players can produce skips, crackle, or uneven playback. The bridge now spaces MP3 writes according to `MP3_BITRATE` instead of immediately forwarding each burst.
-
-Pacing only applies to real MP3 audio. Startup silence is already generated in real time and is not delayed again. After a genuine upstream gap, the pacing clock resets rather than trying to catch up with a large burst.
-
-The reconnect ring-buffer default is also reduced from 2 seconds to 0.5 seconds. Replaying a full two seconds of pre-roll after an MA reconnect could be heard as an obvious repeat.
-
-Recommended Echo-facing values:
-
-```env
-MP3_BITRATE=192k
-STREAM_OUTPUT_PACING=false
-STREAM_OUTPUT_PACING_SLACK_SECONDS=0.25
-STREAM_JITTER_BUFFER_ENABLED=false
-STREAM_JITTER_BUFFER_SECONDS=2.0
-STREAM_JITTER_BUFFER_MAX_SECONDS=8.0
-STREAM_RING_BUFFER_SECONDS=0.5
-```
-
-`/streams` reports `output_pacing_enabled`, `output_pacing_target_kbps`, and `output_pacing_slack_seconds`. On a steady 192 kbps stream, `recent_real_kbps` should settle near the configured rate rather than showing large 800+ kbps bursts.
-
-### v5.4 stream write smoothing
-
-FFmpeg can return very small encoded reads even when the bridge asks the pipe for 16 KB. In v5.4 the bridge keeps codec data unchanged but coalesces adjacent encoded reads before broadcasting them to Music Assistant and hardware players. The default target is 8 KB with a 0.5-second maximum hold time. Startup silence and real audio are never combined in the same coalesced write.
-
-This is intended to reduce bursty HTTP delivery to clients such as smart speakers without adding another codec conversion. Check `/streams`: `avg_chunk_bytes` should now be substantially larger than the few-hundred-byte values seen before v5.4, and each hub reports `coalesce_bytes` and `coalesce_max_seconds`.
-
-Set `STREAM_COALESCE_BYTES=0` to disable this behavior for comparison.
-
-## How streaming works
+## Streaming endpoints
 
 ```text
-Dispatcharr / XC
-      ↓
-one FFmpeg process per active channel + format
-      ↓
-shared encoded stream hub
-      ├── Music Assistant
-      ├── another listener
-      └── reconnecting listener
+/stream/<channel-id>.mp3
+/stream/<channel-id>.aac
+/playlist.m3u8
+/playlist.m3u
+/channels
+/metadata/<channel-id>
+/probe/<channel-id>
 ```
 
-FFmpeg owns normal upstream HTTP reconnects. The bridge does not intentionally kill and respawn FFmpeg because of a short gap in received audio. When the last listener disconnects, the hub remains available for `STREAM_LINGER_SECONDS` before the upstream is closed.
+MP3 is recommended for Echo playback.
 
-### Amazon Echo compatibility
+## Diagnostics
 
-Starting with v5.5, the bridge defaults to **MP3** for both generated playlists and Music Assistant imports. This is specifically intended to improve compatibility with Amazon Echo devices, which can be less tolerant than browser players of raw AAC/ADTS timing, transcoding, and small/bursty stream writes.
-
-The recommended Echo-facing defaults are:
-
-```env
-DEFAULT_FORMAT=mp3
-IMPORT_FORMAT=mp3
-MP3_BITRATE=192k
-STREAM_COALESCE_BYTES=8192
-STREAM_COALESCE_MAX_SECONDS=0.50
-```
-
-AAC endpoints remain available. If you explicitly prefer AAC for another player, set `DEFAULT_FORMAT=aac` and/or `IMPORT_FORMAT=aac`.
-
-## Music Assistant setup
-
-### Automatic format migration
-
-Starting with v5.6, bridge-managed Music Assistant stations are matched by channel ID instead of the full AAC or MP3 URL. When `IMPORT_FORMAT` changes, the bridge confirms the desired format first, then removes the stale format entry for that same channel.
-
-Format migration cleanup runs independently of `MA_REMOVE_MISSING`. That setting is now reserved for channels that disappear from the source catalog. If the desired-format add fails, the existing old-format station is left in place.
-
-`/ma/status` now reports `migrated_count`, `stale_format_removed_count`, and `migration_failures`.
-
-`/ma/radios` compares the current bridge catalog with the actual bridge-managed radio objects stored in Music Assistant. Each station is classified as `correct`, `wrong_format`, `duplicate`, `missing`, or `source_missing`, and the response includes the MA URL(s), desired URL, item IDs, and stale URLs. This is useful for finding old `.aac` objects after an MP3 migration.
-
-
-With automatic synchronization enabled, the bridge can add/update the filtered stations itself.
-
-Force a manual sync:
-
-```bash
-curl -X POST http://YOUR-BRIDGE-HOST:8088/ma/sync
-```
-
-Check sync status:
-
-```bash
-curl http://YOUR-BRIDGE-HOST:8088/ma/status
-```
-
-Audit the actual bridge-managed radio objects stored in Music Assistant:
-
-```bash
-curl http://YOUR-BRIDGE-HOST:8088/ma/radios
-```
-
-The summary counts and per-radio `status` fields make stale AAC entries and duplicates visible without relying on aggregate sync counters.
-
-Preview a full bridge-managed cleanup without deleting anything:
-
-```bash
-curl http://YOUR-BRIDGE-HOST:8088/ma/radios/remove-all
-```
-
-Remove all bridge-managed MA radio objects:
-
-```bash
-curl -X POST 'http://YOUR-BRIDGE-HOST:8088/ma/radios/remove-all?dry_run=false'
-```
-
-Only radios whose Builtin provider URL begins with `MA_MANAGED_URL_PREFIX` are targeted. Unrelated Music Assistant radio stations are left untouched.
-
-Alternatively, Music Assistant can consume the generated playlist:
+### Health
 
 ```text
-http://YOUR-BRIDGE-HOST:8088/playlist.m3u8
+GET /health
 ```
 
-## API endpoints
+The v6 playback section reports the active architecture and supported tuning only. Removed v5 experiment fields are no longer exposed.
 
-| Method | Endpoint | Description |
-| --- | --- | --- |
-| GET | `/` | Bridge summary and endpoint discovery |
-| GET | `/health` | Bridge, catalog, metadata, MA and playback health |
-| GET | `/channels` | Filtered channel catalog with bridge URLs and now-playing data |
-| GET | `/streams` | Active shared hubs, listeners and stream diagnostics |
-| GET | `/playlist.m3u8` | Generated radio playlist |
-| GET | `/playlist.m3u` | Generated radio playlist |
-| GET | `/stream/{channel_id}.aac` | AAC radio stream |
-| GET | `/stream/{channel_id}.mp3` | MP3 radio stream |
-| GET | `/metadata/{channel_id}` | Metadata mapping and current now-playing data |
-| GET | `/probe/{channel_id}` | Probe source audio codec and selected AAC mode |
-| POST | `/catalog/refresh` | Force a catalog refresh |
-| GET | `/ma/status` | Music Assistant synchronization status |
-| GET | `/ma/radios` | Audit actual bridge-managed Music Assistant radio URLs and migration state |
-| GET | `/ma/radios/remove-all` | Preview all bridge-managed MA radios that would be removed |
-| POST | `/ma/radios/remove-all?dry_run=false` | Remove all bridge-managed MA radios; unrelated radios are untouched |
-| POST | `/ma/sync` | Force Music Assistant synchronization |
-| GET | `/api/checks` | Run dependency/API diagnostics |
-| POST | `/api/checks/run` | Force dependency/API diagnostics |
-| GET | `/api/checks/stream/{channel_id}` | Non-disruptive per-channel diagnostic |
-| GET | `/api/checks/stream/{channel_id}?live=true` | Open/warm one source and verify real audio |
+### Active streams
 
-### Full dependency check
-
-```bash
-curl http://YOUR-BRIDGE-HOST:8088/api/checks
+```text
+GET /streams
 ```
 
-It checks:
+Important per-hub fields include:
 
-- Dispatcharr/XC connectivity and authentication
-- Music Assistant connectivity/authentication
-- Ticker/SiriusXM metadata feeds
-- xmplaylist fallback
-- FFmpeg and FFprobe
-- bridge cache and internal stream state
-
-A failed dependency changes the overall result to `degraded`.
-
-### Per-stream check
-
-Without opening a new source:
-
-```bash
-curl http://YOUR-BRIDGE-HOST:8088/api/checks/stream/xc-23261
+```text
+state
+listeners
+current_attempt_number
+seconds_since_last_real_chunk
+current_real_chunk_gap_seconds
+max_real_chunk_gap_seconds
+effective_max_real_chunk_gap_seconds
+avg_real_chunk_gap_seconds
+real_chunk_gap_over_1s_count
+real_chunk_gap_over_3s_count
+real_chunk_gap_over_5s_count
+real_chunk_gap_over_10s_count
+recent_real_kbps
+avg_chunk_bytes
+coalesce_bytes
+coalesce_max_seconds
+ffmpeg_readrate
+ring_buffer_seconds
+dropped_chunks
+slow_subscriber_disconnects
+restart_count
+last_error
 ```
 
-To deliberately open/warm the source:
+For the default 192 kbps MP3 path, a healthy sustained stream should normally show `recent_real_kbps` close to 192 rather than the 300-400+ kbps burst pattern that the pre-v6 path exposed.
 
-```bash
-curl 'http://YOUR-BRIDGE-HOST:8088/api/checks/stream/xc-23261?live=true'
+### Dependency checks
+
+```text
+GET  /api/checks
+POST /api/checks/run
+GET  /api/checks/stream/<channel-id>
 ```
 
-The live check can consume one of the configured upstream connection slots, so avoid running several live checks at the same time when `UPSTREAM_MAX_CONNECTIONS=2`.
+Checks cover the configured source, Music Assistant, metadata providers, FFmpeg/ffprobe, and bridge internals.
+
+## How v6 streaming works
+
+1. A client requests a bridge station.
+2. The shared hub is created or reused.
+3. FFmpeg waits for an upstream slot.
+4. FFmpeg opens the live source with reconnect controls and `-readrate 1`.
+5. If the source is cold, the bridge provides startup silence until the first real FFmpeg audio arrives.
+6. Startup silence ends permanently.
+7. Real encoded audio passes through the 8 KB coalescer.
+8. A partial coalescer buffer is flushed after 500 ms even if no new FFmpeg bytes arrive.
+9. The hub fans the same encoded stream out to listeners.
+10. When the final listener leaves, the source remains hot for the linger interval before closing.
+
+## Amazon Echo compatibility
+
+The v6 defaults come from direct playback testing through Music Assistant and Echo.
+
+The working path is intentionally simple:
+
+- MP3 192 kbps
+- FFmpeg `-readrate 1`
+- no Python output pacing
+- no adaptive jitter buffer
+- no post-start encoded-silence insertion
+- 8 KB coalesced network writes
+- real 500 ms partial-write flush
+
+If browser playback works but Echo does not, first verify that `/streams` shows `ffmpeg_readrate: 1.0`, no subscriber drops, and no repeated FFmpeg restarts.
 
 ## Troubleshooting
 
-### Stream skips or repeats
+### Silence spots
 
-First compare direct Dispatcharr playback with bridge playback.
+Inspect `/streams`.
 
-Then temporarily disable ICY injection:
+If `current_real_chunk_gap_seconds` or the 3/5/10-second counters climb while `recent_real_kbps` remains near 192, the source or FFmpeg is pausing.
 
-```env
-ICY_METADATA_ENABLED=false
-```
-
-Metadata will still be collected and visible through the API. If playback becomes clean, the issue is isolated to the client's handling of in-band ICY metadata.
-
-If the problem remains, inspect:
+If the bitrate swings far above 192 followed by long gaps, verify you are actually running v6 and that the stream status reports:
 
 ```text
-/streams
-/api/checks
-/api/checks/stream/{channel_id}?live=true
+ffmpeg_readrate: 1.0
 ```
 
-Look for upstream restarts, HTTP errors, queue buildup, dropped chunks, slow-subscriber disconnects and abnormal bitrate.
+### Crackle or static on Echo
 
-### Music Assistant will not add a station
+Do not reintroduce the old Python pacing or jitter-buffer environment variables. They are removed from v6.
+
+Confirm:
+
+```text
+format: mp3
+recent_real_kbps: approximately 192
+dropped_chunks: 0
+restart_count: stable
+```
+
+### Music Assistant cannot add a station
 
 Check:
 
 ```text
 /ma/status
 /api/checks
-/probe/{channel_id}
+/api/checks/stream/<channel-id>
 ```
 
-Make sure `PUBLIC_BASE_URL` is reachable from Music Assistant and the MA token has the necessary permissions.
+Also confirm the public bridge URL is reachable from Music Assistant.
 
-### Metadata is old or missing
+### Ticker has no match
 
-Check:
+The bridge automatically falls back to xmplaylist when configured with:
 
-```text
-/metadata/{channel_id}
-/health
-/api/checks
+```env
+METADATA_PROVIDER=ticker
+METADATA_FALLBACK=xmplaylist
 ```
 
-The recommended Ticker metadata source polls every 15 seconds only while a shared stream hub is active. `TICKER_IDLE_POLL_SECONDS=0` disables unnecessary idle polling.
+A Ticker matching failure should not interrupt audio.
 
-## Security
+## Upgrade from v5
 
-Keep the bridge on a trusted LAN or behind your reverse proxy/firewall. The streaming and diagnostics endpoints are not intended to be exposed directly to the public Internet.
+1. Pull the v6 image.
+2. Remove retired v5 variables from your local `.env`.
+3. Keep your XC/Dispatcharr, Music Assistant, metadata, and current stream settings.
+4. Recreate the container.
+5. Confirm `/health` reports `architecture: v6_ffmpeg_readrate`.
+6. Confirm `/streams` reports `ffmpeg_readrate: 1.0`.
 
-Do not commit your real `.env` file. XC passwords, Music Assistant tokens and other secrets belong only in your local environment.
+Example:
 
-The bridge redacts configured credentials from its own error and FFmpeg logs where possible.
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+The existing `/data/bridge-cache.json` can remain. The old `/data/jitter-targets.json` file is no longer read and can be deleted.
 
 ## Persistent data
 
-The Docker Compose configuration stores the last-known-good channel catalog in the `bridge-data` volume:
+The Docker volume stores bridge state under `/data`.
+
+Active v6 persistence:
 
 ```text
 /data/bridge-cache.json
 ```
 
-This allows the bridge to continue using its cached catalog if a scheduled source refresh temporarily fails.
+Live hub/listener state is not persisted.
+
+## Security
+
+Do not commit provider passwords or Music Assistant tokens. The bridge attempts to redact configured XC passwords, MA tokens, and metadata API keys from logs and diagnostic errors.
+
+## Development
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+Build locally:
+
+```bash
+docker compose build
+```
+
+For playback changes, validate `/streams` and `/api/checks/stream/<channel-id>` before changing timing behavior.
 
 ## License
 
-Licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for the full license text and [NOTICE](NOTICE) for project and third-party attribution information.
-
-Copyright 2026 iceman73.
-
-This project is an independent integration tool and is not affiliated with or endorsed by Dispatcharr, Music Assistant, SiriusXM, Amazon, StellarTunerLog, xmplaylist, or their respective owners.
-
-The Apache-2.0 license applies to this project's source code and documentation only. It does not grant rights to third-party audio streams, logos, artwork, metadata, trademarks, subscription services, or other content. Users are responsible for complying with the terms and licensing requirements of the services they connect.
+Apache License 2.0. See `LICENSE` and `NOTICE`.

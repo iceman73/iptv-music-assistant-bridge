@@ -7,7 +7,6 @@ os.environ.setdefault("METADATA_ENABLED", "false")
 from app import Channel, MetadataService, NowPlaying, build_ffmpeg_command, build_icy_block, parse_dispatcharr_m3u, build_xc_channels
 import app
 
-
 def test_m3u_names_and_filtering():
     text = '''#EXTM3U
 #EXTINF:-1 tvg-id="abc" tvg-name="Old Name" tvg-chno="26" group-title="SiriusXM",Classic Vinyl
@@ -19,7 +18,6 @@ http://dispatcharr:9191/proxy/ts/stream/22222222-2222-2222-2222-222222222222
     assert channels[0].name == "Classic Vinyl"
     assert channels[0].channel_number == "26"
     assert channels[0].tvg_id == "abc"
-
 
 def test_stellar_flexible_parser():
     item = MetadataService._parse_stellar_item({
@@ -33,7 +31,6 @@ def test_stellar_flexible_parser():
     assert item.channel_number == "26"
     assert item.album == "Rumours"
     assert item.stream_title == "Fleetwood Mac - Dreams"
-
 
 def test_icy_block_shape():
     # Only validates ICY framing; live metadata cache is tested in-container.
@@ -49,7 +46,6 @@ if __name__ == "__main__":
     test_stellar_flexible_parser()
     test_icy_block_shape()
     print("all tests passed")
-
 
 def test_aac_auto_copies_when_probe_says_aac():
     old_mode = app.AAC_MODE
@@ -67,7 +63,6 @@ def test_aac_auto_copies_when_probe_says_aac():
     finally:
         app.AAC_MODE = old_mode
 
-
 def test_aac_auto_transcodes_non_aac_source():
     old_mode = app.AAC_MODE
     try:
@@ -79,7 +74,6 @@ def test_aac_auto_transcodes_non_aac_source():
         assert "-b:a" in cmd
     finally:
         app.AAC_MODE = old_mode
-
 
 def test_xc_catalog_mapping():
     import app
@@ -113,13 +107,11 @@ def test_xc_catalog_mapping():
         app.XC_CATEGORY_IDS.clear()
         app.XC_CATEGORY_IDS.update(old_ids)
 
-
 def test_normalize_decade_station_names():
     assert app.normalize_name("70s on 7") == "70son7"
     assert app.normalize_name("80s on 8") == "80son8"
     assert app.normalize_name("90s on 9") == "90son9"
     assert app.normalize_name("SXM - SiriusXM Hits 1") == "hits1"
-
 
 def test_xmplaylist_station_lookup_supports_deeplink():
     # Mirrors the important relationship in the live xmplaylist API:
@@ -136,7 +128,6 @@ def test_xmplaylist_station_lookup_supports_deeplink():
         "thepulse": station,
     }
     assert service._xm_stations_by_id["thepulse"]["name"] == "The Pulse"
-
 
 def test_ma_managed_url_extraction_only_owns_bridge_urls():
     old_prefix = app.MA_MANAGED_URL_PREFIX
@@ -158,7 +149,6 @@ def test_ma_managed_url_extraction_only_owns_bridge_urls():
     finally:
         app.MA_MANAGED_URL_PREFIX = old_prefix
 
-
 def test_ma_sync_status_defaults():
     service = app.MusicAssistantSyncService()
     status = service.status()
@@ -171,7 +161,6 @@ def test_ma_sync_status_defaults():
     assert "migration_failures" in status
     assert status["synced_count"] == 0
 
-
 def test_ffmpeg_command_reconnects_at_eof_and_transient_http_errors():
     ch = Channel(channel_id="xc-99", name="Reconnect Test", source_url="http://example.test/live.ts")
     cmd = app.build_ffmpeg_command(ch, "aac", source_codec="aac", force_transcode=True)
@@ -183,7 +172,6 @@ def test_ffmpeg_command_reconnects_at_eof_and_transient_http_errors():
     assert "low_delay" not in cmd
     assert cmd[cmd.index("-probesize") + 1] == "1000000"
     assert cmd[cmd.index("-analyzeduration") + 1] == "2000000"
-
 
 def test_shared_hub_reuses_same_upstream_during_linger():
     async def run():
@@ -231,7 +219,6 @@ def test_shared_hub_reuses_same_upstream_during_linger():
 
     asyncio.run(asyncio.wait_for(run(), timeout=2.0))
 
-
 def test_ma_sync_skips_unchanged_and_only_imports_new_station():
     async def run():
         service = app.MusicAssistantSyncService()
@@ -258,7 +245,6 @@ def test_ma_sync_skips_unchanged_and_only_imports_new_station():
         assert result["synced_count"] == 1
         assert added == [("PopRocks", ch_new.bridge_url(app.IMPORT_FORMAT))]
     asyncio.run(run())
-
 
 def test_ma_add_retries_while_same_shared_stream_is_pinned():
     async def run():
@@ -307,7 +293,6 @@ def test_ma_add_retries_while_same_shared_stream_is_pinned():
 
     asyncio.run(run())
 
-
 def test_startup_silence_forces_stable_aac_transcode():
     ch = Channel(channel_id="xc-500", name="Test", source_url="http://example.test/live.ts")
     cmd = build_ffmpeg_command(ch, "aac", source_codec="aac", force_transcode=True)
@@ -315,7 +300,6 @@ def test_startup_silence_forces_stable_aac_transcode():
     assert cmd[idx + 1] == "aac"
     assert "-ar" in cmd and cmd[cmd.index("-ar") + 1] == app.SAMPLE_RATE
     assert "-ac" in cmd and cmd[cmd.index("-ac") + 1] == app.CHANNELS
-
 
 def test_v5_startup_silence_switches_to_single_real_process():
     async def run():
@@ -355,7 +339,6 @@ def test_v5_startup_silence_switches_to_single_real_process():
 
     asyncio.run(run())
 
-
 def test_stream_hub_health_counters_record_real_audio():
     async def run():
         ch = Channel(channel_id="xc-health", name="Health Test", source_url="http://example.test/live.ts")
@@ -376,8 +359,6 @@ def test_stream_hub_health_counters_record_real_audio():
 
     asyncio.run(run())
 
-
-
 def test_redact_secrets_hides_xc_password():
     old_user, old_pass = app.XC_USERNAME, app.XC_PASSWORD
     try:
@@ -389,7 +370,6 @@ def test_redact_secrets_hides_xc_password():
         assert "/live/***/***/23308.ts" in safe
     finally:
         app.XC_USERNAME, app.XC_PASSWORD = old_user, old_pass
-
 
 def test_ring_buffer_prerolls_new_subscriber():
     async def run():
@@ -416,50 +396,6 @@ def test_ring_buffer_prerolls_new_subscriber():
             app.STREAM_SUBSCRIBER_QUEUE_CHUNKS = old_q
     asyncio.run(run())
 
-
-
-def test_v5_real_audio_stall_does_not_kill_ffmpeg_generator():
-    async def run():
-        old_silence = app.ffmpeg_silence_stream
-        old_audio = app.ffmpeg_audio_stream
-        old_enabled = app.STARTUP_SILENCE_ENABLED
-        old_stall = app.REAL_AUDIO_STALL_SECONDS
-        old_gap_enabled = app.POST_START_GAP_FILL_ENABLED
-
-        async def fake_silence(fmt):
-            while True:
-                await asyncio.sleep(0.001)
-                yield b"S"
-
-        async def fake_audio(channel, fmt, force_transcode=False, diagnostic_callback=None):
-            yield b"R1"
-            await asyncio.sleep(0.05)  # greater than diagnostic threshold
-            yield b"R2"
-
-        try:
-            app.ffmpeg_silence_stream = fake_silence
-            app.ffmpeg_audio_stream = fake_audio
-            app.STARTUP_SILENCE_ENABLED = True
-            app.REAL_AUDIO_STALL_SECONDS = 0.01
-            app.POST_START_GAP_FILL_ENABLED = False
-            ch = Channel(channel_id="xc-stall", name="Stall Test", source_url="http://example.test/live.ts")
-            gen = app.startup_protected_audio_stream(ch, "aac")
-            chunks = []
-            try:
-                while True:
-                    chunks.append(await asyncio.wait_for(anext(gen), timeout=0.5))
-            except StopAsyncIteration:
-                pass
-            assert b"R1" in chunks and b"R2" in chunks
-        finally:
-            app.ffmpeg_silence_stream = old_silence
-            app.ffmpeg_audio_stream = old_audio
-            app.STARTUP_SILENCE_ENABLED = old_enabled
-            app.REAL_AUDIO_STALL_SECONDS = old_stall
-            app.POST_START_GAP_FILL_ENABLED = old_gap_enabled
-    asyncio.run(run())
-
-
 def test_ticker_bulk_parser_and_xc_dispatcharr_id():
     rows = [{"name": "Classic Vinyl", "deeplink_id": "classicvinyl", "channel_number": 26}]
     stations = {"classicvinyl": {"artist": "Fleetwood Mac", "title": "Dreams", "cut_type": "song"}}
@@ -475,8 +411,6 @@ def test_ticker_bulk_parser_and_xc_dispatcharr_id():
           "stream_icon": "http://dispatcharr:9191/api/channels/logos/55535/cache/"}],
     )
     assert channels[0].dispatcharr_id == "55535"
-
-
 
 def test_ticker_idle_wait_wakes_immediately_on_stream_activity():
     async def run():
@@ -495,7 +429,6 @@ def test_ticker_idle_wait_wakes_immediately_on_stream_activity():
             app.TICKER_IDLE_POLL_SECONDS = old_idle
     asyncio.run(run())
 
-
 def test_ticker_status_reports_active_and_idle_poll_intervals():
     old_active = app.TICKER_ACTIVE_POLL_SECONDS
     old_idle = app.TICKER_IDLE_POLL_SECONDS
@@ -512,7 +445,6 @@ def test_ticker_status_reports_active_and_idle_poll_intervals():
         app.TICKER_ACTIVE_POLL_SECONDS = old_active
         app.TICKER_IDLE_POLL_SECONDS = old_idle
 
-
 def test_icy_cache_is_prebuilt_and_network_free():
     svc = MetadataService()
     item = app.NowPlaying(provider="ticker", channel_name="Classic Vinyl", artist="Fleetwood Mac", title="Dreams", fetched_at=app.time.time())
@@ -521,7 +453,6 @@ def test_icy_cache_is_prebuilt_and_network_free():
     block = svc.get_icy_block(ch)
     assert isinstance(block, bytes)
     assert b"Fleetwood Mac - Dreams" in block
-
 
 def test_icy_wrapper_exact_audio_byte_accounting():
     async def run():
@@ -546,10 +477,9 @@ def test_icy_wrapper_exact_audio_byte_accounting():
             app.metadata_service = old_service
     asyncio.run(run())
 
-
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.13"
+    assert row["version"] == "6.0.0"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -566,7 +496,6 @@ def test_coalesces_tiny_ffmpeg_reads_without_changing_bytes():
 
     asyncio.run(run())
 
-
 def test_ffmpeg_mp3_uses_readrate_before_input():
     ch = Channel(channel_id="xc-readrate", name="Readrate", source_url="http://example.test/live.ts")
     cmd = app.build_ffmpeg_command(ch, "mp3")
@@ -574,7 +503,6 @@ def test_ffmpeg_mp3_uses_readrate_before_input():
     input_index = cmd.index("-i")
     assert cmd[readrate_index + 1] == "1"
     assert readrate_index < input_index
-
 
 def test_stream_hub_effective_gap_includes_current_in_progress_gap():
     async def run():
@@ -588,7 +516,6 @@ def test_stream_hub_effective_gap_includes_current_in_progress_gap():
         assert status["max_real_chunk_gap_seconds"] == 0.0
 
     asyncio.run(run())
-
 
 def test_coalescer_flushes_partial_chunk_on_real_timer_without_new_source_data():
     async def run():
@@ -613,7 +540,6 @@ def test_coalescer_flushes_partial_chunk_on_real_timer_without_new_source_data()
 
     asyncio.run(run())
 
-
 def test_stream_hub_reports_real_chunk_gap_diagnostics():
     async def run():
         ch = Channel(channel_id="xc-gap", name="Gap Test", source_url="http://example.test/live.ts")
@@ -632,7 +558,6 @@ def test_stream_hub_reports_real_chunk_gap_diagnostics():
 
     asyncio.run(run())
 
-
 def test_coalescer_flushes_on_silence_to_real_audio_transition():
     async def run():
         async def src():
@@ -646,7 +571,6 @@ def test_coalescer_flushes_on_silence_to_real_audio_transition():
 
     asyncio.run(run())
 
-
 def test_ma_channel_identity_ignores_audio_extension():
     old_prefix = app.MA_MANAGED_URL_PREFIX
     try:
@@ -656,7 +580,6 @@ def test_ma_channel_identity_ignores_audio_extension():
         assert get_id("http://bridge:8088/stream/xc-23260.mp3") == "xc-23260"
     finally:
         app.MA_MANAGED_URL_PREFIX = old_prefix
-
 
 def test_ma_sync_migrates_old_format_when_remove_missing_is_off():
     async def run():
@@ -704,7 +627,6 @@ def test_ma_sync_migrates_old_format_when_remove_missing_is_off():
             app.PUBLIC_BASE_URL = old_public
     asyncio.run(run())
 
-
 def test_shared_hub_current_attempt_diagnostics_reset_cleanly():
     hub = app.SharedStreamHub(Channel(channel_id="xc-1", name="Test"), "mp3")
     hub.last_real_chunk_at = "old"
@@ -722,7 +644,6 @@ def test_shared_hub_current_attempt_diagnostics_reset_cleanly():
     assert list(hub._rate_window) == []
     assert list(hub._ring_buffer) == []
 
-
 def test_upstream_state_tracks_slot_and_http_errors():
     hub = app.SharedStreamHub(Channel(channel_id="xc-2", name="Test"), "mp3")
     hub._reset_attempt_diagnostics()
@@ -736,7 +657,6 @@ def test_upstream_state_tracks_slot_and_http_errors():
     assert hub.state == "source_error"
     assert hub.current_attempt_http_503_count == 1
     assert hub.current_attempt_http_error_count == 1
-
 
 def test_import_warmup_release_stops_idle_hub_without_linger():
     async def run():
@@ -756,7 +676,6 @@ def test_import_warmup_release_stops_idle_hub_without_linger():
         assert hub.state == "idle"
 
     asyncio.run(run())
-
 
 def test_normal_unpin_still_uses_linger():
     async def run():
@@ -792,7 +711,6 @@ def test_normal_unpin_still_uses_linger():
             app.STREAM_LINGER_SECONDS = old_linger
 
     asyncio.run(run())
-
 
 def test_ma_radio_audit_classifies_correct_wrong_format_duplicate_and_missing():
     async def run():
@@ -855,14 +773,12 @@ def test_ma_radio_audit_classifies_correct_wrong_format_duplicate_and_missing():
 
     asyncio.run(run())
 
-
 def test_real_audio_clears_stale_last_error():
     hub = app.SharedStreamHub(Channel(channel_id="xc-9", name="Recovery"), "mp3")
     hub.last_error = "RuntimeError: old failure"
     hub._record_chunk(b"abc", real_audio=True)
     assert hub.last_error == ""
     assert hub.state == "real_audio"
-
 
 def test_remove_all_managed_radios_dry_run_and_execute():
     async def run():
@@ -919,7 +835,6 @@ def test_remove_all_managed_radios_dry_run_and_execute():
 
     asyncio.run(run())
 
-
 def test_stream_manager_marks_playback_and_demand_type():
     async def run():
         manager = app.StreamManager()
@@ -945,7 +860,6 @@ def test_stream_manager_marks_playback_and_demand_type():
             hub.subscribe = original
 
     asyncio.run(run())
-
 
 def test_warmup_is_preempted_while_playback_active():
     async def run():
@@ -990,7 +904,6 @@ def test_warmup_is_preempted_while_playback_active():
 
     asyncio.run(run())
 
-
 def test_hub_status_reports_demand_type():
     hub = app.SharedStreamHub(Channel(channel_id="xc-demand", name="Demand"), "mp3")
     assert hub.status()["demand_type"] == "linger"
@@ -998,7 +911,6 @@ def test_hub_status_reports_demand_type():
     assert hub.status()["demand_type"] == "ma_warmup"
     hub.subscribers["x"] = asyncio.Queue()
     assert hub.status()["demand_type"] == "playback"
-
 
 def test_playback_preempts_unrelated_warmup_hub():
     async def run():
@@ -1039,140 +951,17 @@ def test_playback_preempts_unrelated_warmup_hub():
 
     asyncio.run(run())
 
-
-def test_mp3_output_pacing_limits_burst_rate():
-    async def run():
-        old_enabled = app.STREAM_OUTPUT_PACING
-        old_bitrate = app.MP3_BITRATE
-        old_slack = app.STREAM_OUTPUT_PACING_SLACK_SECONDS
-        sleeps = []
-        real_sleep = asyncio.sleep
-
-        async def fake_sleep(delay):
-            sleeps.append(delay)
-            await real_sleep(0)
-
-        async def src():
-            yield b"a" * 24000, True
-            yield b"b" * 24000, True
-            yield b"c" * 24000, True
-
-        try:
-            app.STREAM_OUTPUT_PACING = True
-            app.MP3_BITRATE = "192k"
-            app.STREAM_OUTPUT_PACING_SLACK_SECONDS = 0.25
-            original_sleep = app.asyncio.sleep
-            app.asyncio.sleep = fake_sleep
-            out = [item async for item in app.pace_encoded_audio(src(), "mp3")]
-            assert len(out) == 3
-            assert b"".join(chunk for chunk, _ in out) == (b"a" * 24000 + b"b" * 24000 + b"c" * 24000)
-            assert any(delay >= 0.9 for delay in sleeps)
-        finally:
-            app.asyncio.sleep = original_sleep
-            app.STREAM_OUTPUT_PACING = old_enabled
-            app.MP3_BITRATE = old_bitrate
-            app.STREAM_OUTPUT_PACING_SLACK_SECONDS = old_slack
-
-    asyncio.run(run())
-
-
-def test_output_pacing_passes_silence_without_delay_and_resets_clock():
-    async def run():
-        old_enabled = app.STREAM_OUTPUT_PACING
-        old_bitrate = app.MP3_BITRATE
-        try:
-            app.STREAM_OUTPUT_PACING = True
-            app.MP3_BITRATE = "192k"
-
-            async def src():
-                yield b"S" * 100, False
-                yield b"R" * 100, True
-
-            out = [item async for item in app.pace_encoded_audio(src(), "mp3")]
-            assert out == [(b"S" * 100, False), (b"R" * 100, True)]
-        finally:
-            app.STREAM_OUTPUT_PACING = old_enabled
-            app.MP3_BITRATE = old_bitrate
-
-    asyncio.run(run())
-
-
 def test_bitrate_parser():
     assert app._bitrate_to_bps("192k") == 192000
     assert app._bitrate_to_bps("128000") == 128000
     assert app._bitrate_to_bps("1.5m") == 1500000
     assert app._bitrate_to_bps("bad") == 0
 
-
-def test_post_start_gap_fill_keeps_stream_continuous():
-    async def run():
-        old_silence = app.ffmpeg_silence_stream
-        old_audio = app.ffmpeg_audio_stream
-        old_enabled = app.STARTUP_SILENCE_ENABLED
-        old_gap_enabled = app.POST_START_GAP_FILL_ENABLED
-        old_gap_after = app.POST_START_GAP_FILL_AFTER_SECONDS
-
-        events = []
-        kinds = []
-
-        async def fake_silence(fmt):
-            while True:
-                await asyncio.sleep(0.002)
-                yield b"S"
-
-        async def fake_audio(channel, fmt, force_transcode=False, diagnostic_callback=None):
-            yield b"R1"
-            await asyncio.sleep(0.03)
-            yield b"R2"
-            return
-
-        try:
-            app.ffmpeg_silence_stream = fake_silence
-            app.ffmpeg_audio_stream = fake_audio
-            app.STARTUP_SILENCE_ENABLED = True
-            app.POST_START_GAP_FILL_ENABLED = True
-            app.POST_START_GAP_FILL_AFTER_SECONDS = 0.01
-
-            ch = Channel(channel_id="xc-gap", name="Gap Test", source_url="http://example.test/live.ts")
-            gen = app.startup_protected_audio_stream(
-                ch,
-                "mp3",
-                diagnostic_callback=events.append,
-                output_kind_callback=kinds.append,
-            )
-            chunks = []
-            try:
-                for _ in range(50):
-                    chunk = await asyncio.wait_for(anext(gen), timeout=0.2)
-                    chunks.append(chunk)
-                    if chunk == b"R2":
-                        break
-                else:
-                    raise AssertionError("R2 never arrived during bounded gap-fill test")
-            finally:
-                await asyncio.wait_for(gen.aclose(), timeout=0.5)
-
-            assert b"R1" in chunks and b"R2" in chunks
-            between = chunks[chunks.index(b"R1") + 1:chunks.index(b"R2")]
-            assert b"S" in between
-            assert "gap_fill_start" in events
-            assert "gap_fill_end" in events
-            assert False in kinds and True in kinds
-        finally:
-            app.ffmpeg_silence_stream = old_silence
-            app.ffmpeg_audio_stream = old_audio
-            app.STARTUP_SILENCE_ENABLED = old_enabled
-            app.POST_START_GAP_FILL_ENABLED = old_gap_enabled
-            app.POST_START_GAP_FILL_AFTER_SECONDS = old_gap_after
-
-    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
-
 def test_mp3_streams_disable_midstream_headers_for_clean_splicing():
     ch = Channel(channel_id="xc-mp3", name="MP3", source_url="http://example.test/live.ts")
     cmd = app.build_ffmpeg_command(ch, "mp3")
     assert "-write_xing" in cmd and cmd[cmd.index("-write_xing") + 1] == "0"
     assert "-id3v2_version" in cmd and cmd[cmd.index("-id3v2_version") + 1] == "0"
-
 
 def test_channel_switch_preempts_old_linger_hub():
     async def run():
@@ -1211,179 +1000,19 @@ def test_channel_switch_preempts_old_linger_hub():
 
     asyncio.run(asyncio.wait_for(run(), timeout=2.0))
 
-
-def test_mp3_jitter_buffer_primes_before_real_output():
+def test_v6_stream_health_excludes_retired_timing_layers():
     async def run():
-        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
-        old_seconds = app.STREAM_JITTER_BUFFER_SECONDS
-        old_max = app.STREAM_JITTER_BUFFER_MAX_SECONDS
-        old_bitrate = app.MP3_BITRATE
-        events = []
-
-        async def src():
-            yield (b"A" * 24000, True)
-            yield (b"B" * 24000, True)
-            yield (b"C" * 24000, True)
-
-        try:
-            app.STREAM_JITTER_BUFFER_ENABLED = True
-            app.STREAM_JITTER_BUFFER_SECONDS = 2.0
-            app.STREAM_JITTER_BUFFER_MAX_SECONDS = 8.0
-            app.MP3_BITRATE = "192k"
-
-            gen = app.jitter_buffer_encoded_audio(src(), "mp3", status_callback=lambda e, v: events.append((e, v)))
-            first = await asyncio.wait_for(anext(gen), timeout=0.5)
-            assert first == (b"A" * 24000, True)
-            assert any(event == "primed" and value >= 2.0 for event, value in events)
-            await gen.aclose()
-        finally:
-            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
-            app.STREAM_JITTER_BUFFER_SECONDS = old_seconds
-            app.STREAM_JITTER_BUFFER_MAX_SECONDS = old_max
-            app.MP3_BITRATE = old_bitrate
-
-    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
-
-
-def test_jitter_buffer_passthrough_for_aac():
-    async def run():
-        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
-        try:
-            app.STREAM_JITTER_BUFFER_ENABLED = True
-
-            async def src():
-                yield (b"A", True)
-                yield (b"B", True)
-
-            out = [item async for item in app.jitter_buffer_encoded_audio(src(), "aac")]
-            assert out == [(b"A", True), (b"B", True)]
-        finally:
-            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
-
+        ch = Channel(channel_id="xc-v6", name="V6 Health", source_url="http://example.test/live.ts")
+        hub = app.SharedStreamHub(ch, "mp3")
+        await hub._broadcast(b"A" * 8192, real_audio=True)
+        status = hub.status()
+        assert status["ffmpeg_readrate"] == 1.0
+        assert "output_pacing_enabled" not in status
+        assert "jitter_buffer_enabled" not in status
+        assert "gap_fill_enabled" not in status
     asyncio.run(run())
 
 
-def test_adaptive_jitter_increases_target_after_underrun():
-    async def run():
-        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
-        old_adaptive = app.STREAM_JITTER_BUFFER_ADAPTIVE
-        old_seconds = app.STREAM_JITTER_BUFFER_SECONDS
-        old_min = app.STREAM_JITTER_BUFFER_MIN_SECONDS
-        old_max = app.STREAM_JITTER_BUFFER_MAX_SECONDS
-        old_increase = app.STREAM_JITTER_BUFFER_INCREASE_SECONDS
-        old_bitrate = app.MP3_BITRATE
-        events = []
-
-        async def src():
-            yield (b"A" * 24000, True)
-            await asyncio.sleep(0.03)
-            yield (b"B" * 24000, True)
-            yield (b"C" * 24000, True)
-            yield (b"D" * 24000, True)
-
-        try:
-            app.STREAM_JITTER_BUFFER_ENABLED = True
-            app.STREAM_JITTER_BUFFER_ADAPTIVE = True
-            app.STREAM_JITTER_BUFFER_SECONDS = 1.0
-            app.STREAM_JITTER_BUFFER_MIN_SECONDS = 1.0
-            app.STREAM_JITTER_BUFFER_MAX_SECONDS = 4.0
-            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = 2.0
-            app.MP3_BITRATE = "192k"
-
-            gen = app.jitter_buffer_encoded_audio(
-                src(),
-                "mp3",
-                status_callback=lambda e, v: events.append((e, v)),
-                initial_target_seconds=1.0,
-            )
-            first = await asyncio.wait_for(anext(gen), timeout=0.5)
-            assert first == (b"A" * 24000, True)
-            second = await asyncio.wait_for(anext(gen), timeout=0.5)
-            assert second == (b"B" * 24000, True)
-            assert any(event == "underrun" for event, _ in events)
-            assert any(event == "target_increase" and value == 3.0 for event, value in events)
-            await gen.aclose()
-        finally:
-            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
-            app.STREAM_JITTER_BUFFER_ADAPTIVE = old_adaptive
-            app.STREAM_JITTER_BUFFER_SECONDS = old_seconds
-            app.STREAM_JITTER_BUFFER_MIN_SECONDS = old_min
-            app.STREAM_JITTER_BUFFER_MAX_SECONDS = old_max
-            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = old_increase
-            app.MP3_BITRATE = old_bitrate
-
-    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
-
-
-def test_proactive_low_water_raises_target_before_underrun():
-    async def run():
-        old_enabled = app.STREAM_JITTER_BUFFER_ENABLED
-        old_adaptive = app.STREAM_JITTER_BUFFER_ADAPTIVE
-        old_seconds = app.STREAM_JITTER_BUFFER_SECONDS
-        old_min = app.STREAM_JITTER_BUFFER_MIN_SECONDS
-        old_max = app.STREAM_JITTER_BUFFER_MAX_SECONDS
-        old_low = app.STREAM_JITTER_BUFFER_LOW_WATER_SECONDS
-        old_increase = app.STREAM_JITTER_BUFFER_INCREASE_SECONDS
-        old_bitrate = app.MP3_BITRATE
-        events = []
-
-        async def src():
-            for byte in (b"A", b"B", b"C"):
-                yield (byte * 24000, True)
-
-        try:
-            app.STREAM_JITTER_BUFFER_ENABLED = True
-            app.STREAM_JITTER_BUFFER_ADAPTIVE = True
-            app.STREAM_JITTER_BUFFER_SECONDS = 3.0
-            app.STREAM_JITTER_BUFFER_MIN_SECONDS = 1.0
-            app.STREAM_JITTER_BUFFER_MAX_SECONDS = 8.0
-            app.STREAM_JITTER_BUFFER_LOW_WATER_SECONDS = 2.0
-            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = 2.0
-            app.MP3_BITRATE = "192k"
-
-            gen = app.jitter_buffer_encoded_audio(
-                src(),
-                "mp3",
-                status_callback=lambda e, v: events.append((e, v)),
-                initial_target_seconds=3.0,
-            )
-            first = await asyncio.wait_for(anext(gen), timeout=0.5)
-            assert first == (b"A" * 24000, True)
-            # Low-water handling runs when the generator resumes after yielding
-            # the first chunk, so advance once more before asserting events.
-            second = await asyncio.wait_for(anext(gen), timeout=0.5)
-            assert second == (b"B" * 24000, True)
-            assert any(event == "low_water" for event, _ in events)
-            assert any(event == "target_increase" and value == 5.0 for event, value in events)
-            await gen.aclose()
-        finally:
-            app.STREAM_JITTER_BUFFER_ENABLED = old_enabled
-            app.STREAM_JITTER_BUFFER_ADAPTIVE = old_adaptive
-            app.STREAM_JITTER_BUFFER_SECONDS = old_seconds
-            app.STREAM_JITTER_BUFFER_MIN_SECONDS = old_min
-            app.STREAM_JITTER_BUFFER_MAX_SECONDS = old_max
-            app.STREAM_JITTER_BUFFER_LOW_WATER_SECONDS = old_low
-            app.STREAM_JITTER_BUFFER_INCREASE_SECONDS = old_increase
-            app.MP3_BITRATE = old_bitrate
-
-    asyncio.run(asyncio.wait_for(run(), timeout=2.0))
-
-
-def test_persisted_jitter_target_is_reused_for_new_hub(tmp_path):
-    old_state_file = app.STREAM_JITTER_STATE_FILE
-    old_targets = dict(app._jitter_learned_targets)
-    try:
-        app.STREAM_JITTER_STATE_FILE = str(tmp_path / "jitter-targets.json")
-        app._jitter_learned_targets.clear()
-        app._remember_jitter_target("xc-persist:mp3", 12.0)
-
-        ch = Channel(channel_id="xc-persist", name="Persist")
-        hub = app.SharedStreamHub(ch, "mp3")
-        assert hub.jitter_buffer_adaptive_target_seconds == 12.0
-
-        payload = json.loads((tmp_path / "jitter-targets.json").read_text())
-        assert payload["targets"]["xc-persist:mp3"] == 12.0
-    finally:
-        app.STREAM_JITTER_STATE_FILE = old_state_file
-        app._jitter_learned_targets.clear()
-        app._jitter_learned_targets.update(old_targets)
+def test_v6_user_agent_and_bridge_version():
+    assert "6.0.0" in app.DISPATCHARR_USER_AGENT
+    assert app._check_bridge_local()["version"] == "6.0.0"
