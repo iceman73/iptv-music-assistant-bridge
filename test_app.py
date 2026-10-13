@@ -479,7 +479,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "6.0.0"
+    assert row["version"] == app.APP_VERSION
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -1008,5 +1008,11 @@ def test_v6_stream_health_excludes_retired_timing_layers():
 
 
 def test_v6_user_agent_and_bridge_version():
-    assert "6.0.0" in app.DISPATCHARR_USER_AGENT
-    assert app._check_bridge_local()["version"] == "6.0.0"
+    assert app.APP_VERSION in app.DISPATCHARR_USER_AGENT
+    assert app._check_bridge_local()["version"] == app.APP_VERSION
+
+
+def test_health_publishes_bridge_version():
+    payload = asyncio.run(app.health())
+    assert payload["status"] == "ok"
+    assert payload["version"] == app.APP_VERSION

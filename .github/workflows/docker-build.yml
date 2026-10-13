@@ -50,9 +50,9 @@ jobs:
           import re
 
           text = pathlib.Path("app.py").read_text(encoding="utf-8")
-          match = re.search(r'DISPATCHARR_USER_AGENT\s*=.*?Dispatcharr-MA-Bridge/([0-9]+\.[0-9]+\.[0-9]+)', text)
+          match = re.search(r'^APP_VERSION\s*=\s*["\']([0-9]+\.[0-9]+\.[0-9]+)["\']', text, re.MULTILINE)
           if not match:
-              raise SystemExit("Could not determine bridge version from app.py")
+              raise SystemExit("Could not determine APP_VERSION from app.py")
 
           app_version = match.group(1)
           tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")

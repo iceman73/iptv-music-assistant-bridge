@@ -25,6 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("dispatcharr-ma-bridge")
 
 APP_NAME = "Dispatcharr / XC Music Assistant Bridge"
+APP_VERSION = "6.0.0"
 SOURCE_MODE = os.getenv("SOURCE_MODE", "dispatcharr").strip().lower()
 
 DISPATCHARR_BASE_URL = os.getenv("DISPATCHARR_BASE_URL", "http://dispatcharr:9191").rstrip("/")
@@ -40,7 +41,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/6.0.0")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", f"Dispatcharr-MA-Bridge/{APP_VERSION}")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -2801,7 +2802,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "6.0.0",
+        "status": "ok" if (not cache or writable) else "warn", "version": APP_VERSION,
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
@@ -2860,6 +2861,7 @@ async def index():
 async def health():
     return {
         "status": "ok",
+        "version": APP_VERSION,
         "catalog": catalog.status(),
         "metadata": metadata_service.status(),
         "music_assistant_sync": ma_sync_service.status(),

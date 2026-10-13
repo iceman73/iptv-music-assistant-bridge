@@ -328,6 +328,8 @@ GET /health
 
 The v6 playback section reports the active architecture and supported tuning only. Removed v5 experiment fields are no longer exposed.
 
+The top-level health response also publishes the running bridge `version`, for example `"version": "6.0.0"`, so deployments can confirm exactly which release is active.
+
 ### Active streams
 
 ```text
