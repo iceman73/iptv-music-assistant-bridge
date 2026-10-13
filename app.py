@@ -40,7 +40,7 @@ SAMPLE_RATE = os.getenv("SAMPLE_RATE", "48000")
 CHANNELS = os.getenv("CHANNELS", "2")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 FFMPEG_LOG_LEVEL = os.getenv("FFMPEG_LOG_LEVEL", "warning")
-DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.11")
+DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", "Dispatcharr-MA-Bridge/5.6.12")
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
@@ -869,13 +869,13 @@ async def coalesce_audio_chunks(
     target_bytes: int | None = None,
     max_delay_seconds: float | None = None,
 ) -> AsyncIterator[tuple[bytes, bool]]:
-    """Coalesce tiny encoded FFmpeg reads into steadier client writes.
+    """Coalesce small encoded reads, with a true wall-clock flush deadline.
 
-    FFmpeg's asyncio pipe may return a few hundred bytes even when read() asks for
-    much more. Broadcasting every tiny read produces bursty HTTP delivery that
-    browsers tolerate well but some hardware radio clients do not. Keep encoded
-    bytes untouched and only group adjacent chunks with the same real/silence
-    classification. State transitions and stream end always flush immediately.
+    The previous implementation only checked max_delay when another source chunk
+    arrived. A partial buffer could therefore sit for several seconds during an
+    upstream pause. This version keeps one pending source read and independently
+    flushes any partial network write once max_delay expires. Encoded bytes are
+    never modified, and silence/real-audio transitions are never combined.
     """
     target = STREAM_COALESCE_BYTES if target_bytes is None else max(0, int(target_bytes))
     max_delay = STREAM_COALESCE_MAX_SECONDS if max_delay_seconds is None else max(0.0, float(max_delay_seconds))
@@ -885,40 +885,66 @@ async def coalesce_audio_chunks(
                 yield chunk, real_audio
         return
 
+    iterator = source.__aiter__()
+    next_task: asyncio.Task | None = asyncio.create_task(anext(iterator), name="coalescer-source-read")
     pending = bytearray()
     pending_real: bool | None = None
     pending_since = 0.0
 
-    async for chunk, real_audio in source:
-        if not chunk:
-            continue
-        now = time.monotonic()
+    try:
+        while next_task is not None:
+            timeout: float | None = None
+            if pending and max_delay > 0:
+                elapsed = max(0.0, time.monotonic() - pending_since)
+                timeout = max(0.0, max_delay - elapsed)
 
-        # Never combine startup silence and real audio in one network write.
-        if pending and pending_real is not None and real_audio != pending_real:
-            yield bytes(pending), pending_real
-            pending.clear()
-            pending_real = None
-            pending_since = 0.0
+            done, _ = await asyncio.wait({next_task}, timeout=timeout)
 
-        if not pending:
-            pending_real = real_audio
-            pending_since = now
-        pending.extend(chunk)
+            # No new FFmpeg/source bytes arrived before the deadline. Flush the
+            # partial write now instead of waiting for another source chunk.
+            if not done:
+                if pending:
+                    yield bytes(pending), bool(pending_real)
+                    pending.clear()
+                    pending_real = None
+                    pending_since = 0.0
+                continue
 
-        while len(pending) >= target:
-            yield bytes(pending[:target]), bool(pending_real)
-            del pending[:target]
-            pending_since = now if pending else 0.0
+            try:
+                chunk, real_audio = next_task.result()
+            except StopAsyncIteration:
+                next_task = None
+                break
 
-        if pending and max_delay > 0 and (now - pending_since) >= max_delay:
+            next_task = asyncio.create_task(anext(iterator), name="coalescer-source-read")
+            if not chunk:
+                continue
+
+            now = time.monotonic()
+
+            # Never combine startup silence and real audio in one network write.
+            if pending and pending_real is not None and real_audio != pending_real:
+                yield bytes(pending), pending_real
+                pending.clear()
+                pending_real = None
+                pending_since = 0.0
+
+            if not pending:
+                pending_real = real_audio
+                pending_since = now
+            pending.extend(chunk)
+
+            while len(pending) >= target:
+                yield bytes(pending[:target]), bool(pending_real)
+                del pending[:target]
+                pending_since = time.monotonic() if pending else 0.0
+
+        if pending:
             yield bytes(pending), bool(pending_real)
-            pending.clear()
-            pending_real = None
-            pending_since = 0.0
-
-    if pending:
-        yield bytes(pending), bool(pending_real)
+    finally:
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+            await asyncio.gather(next_task, return_exceptions=True)
 
 
 class SharedStreamHub:
@@ -947,6 +973,13 @@ class SharedStreamHub:
         self.last_real_chunk_at = ""
         self._last_chunk_monotonic = 0.0
         self._last_real_chunk_monotonic = 0.0
+        self.real_chunk_gap_count = 0
+        self.real_chunk_gap_total_seconds = 0.0
+        self.max_real_chunk_gap_seconds = 0.0
+        self.real_chunk_gap_over_1s_count = 0
+        self.real_chunk_gap_over_3s_count = 0
+        self.real_chunk_gap_over_5s_count = 0
+        self.real_chunk_gap_over_10s_count = 0
         self._rate_window: list[tuple[float, int]] = []
         self.dropped_chunks = 0
         self.slow_subscriber_disconnects = 0
@@ -990,6 +1023,13 @@ class SharedStreamHub:
         self.last_real_chunk_at = ""
         self._last_chunk_monotonic = 0.0
         self._last_real_chunk_monotonic = 0.0
+        self.real_chunk_gap_count = 0
+        self.real_chunk_gap_total_seconds = 0.0
+        self.max_real_chunk_gap_seconds = 0.0
+        self.real_chunk_gap_over_1s_count = 0
+        self.real_chunk_gap_over_3s_count = 0
+        self.real_chunk_gap_over_5s_count = 0
+        self.real_chunk_gap_over_10s_count = 0
         self._rate_window.clear()
         self._ring_buffer.clear()
         self.waiting_for_upstream_slot = False
@@ -1144,6 +1184,19 @@ class SharedStreamHub:
             self.last_error = ""
             self.real_audio_bytes += size
             self.real_audio_chunks += 1
+            if self._last_real_chunk_monotonic:
+                gap = max(0.0, now_mono - self._last_real_chunk_monotonic)
+                self.real_chunk_gap_count += 1
+                self.real_chunk_gap_total_seconds += gap
+                self.max_real_chunk_gap_seconds = max(self.max_real_chunk_gap_seconds, gap)
+                if gap > 1.0:
+                    self.real_chunk_gap_over_1s_count += 1
+                if gap > 3.0:
+                    self.real_chunk_gap_over_3s_count += 1
+                if gap > 5.0:
+                    self.real_chunk_gap_over_5s_count += 1
+                if gap > 10.0:
+                    self.real_chunk_gap_over_10s_count += 1
             self.last_real_chunk_at = now_iso
             self._last_real_chunk_monotonic = now_mono
             self._rate_window.append((now_mono, size))
@@ -1415,6 +1468,14 @@ class SharedStreamHub:
             "last_real_chunk_at": self.last_real_chunk_at,
             "seconds_since_last_chunk": round(now_mono - self._last_chunk_monotonic, 3) if self._last_chunk_monotonic else None,
             "seconds_since_last_real_chunk": round(now_mono - self._last_real_chunk_monotonic, 3) if self._last_real_chunk_monotonic else None,
+            "max_real_chunk_gap_seconds": round(self.max_real_chunk_gap_seconds, 3),
+            "avg_real_chunk_gap_seconds": round(
+                self.real_chunk_gap_total_seconds / self.real_chunk_gap_count, 3
+            ) if self.real_chunk_gap_count else 0.0,
+            "real_chunk_gap_over_1s_count": self.real_chunk_gap_over_1s_count,
+            "real_chunk_gap_over_3s_count": self.real_chunk_gap_over_3s_count,
+            "real_chunk_gap_over_5s_count": self.real_chunk_gap_over_5s_count,
+            "real_chunk_gap_over_10s_count": self.real_chunk_gap_over_10s_count,
             "total_output_bytes": self.total_output_bytes,
             "real_audio_bytes": self.real_audio_bytes,
             "total_chunks": self.total_chunks,
@@ -3253,7 +3314,7 @@ def _check_bridge_local() -> dict[str, Any]:
     cache_parent = cache.parent if cache else None
     writable = bool(cache_parent and cache_parent.exists() and os.access(cache_parent, os.W_OK))
     return {
-        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.11",
+        "status": "ok" if (not cache or writable) else "warn", "version": "5.6.12",
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,

@@ -549,7 +549,7 @@ def test_icy_wrapper_exact_audio_byte_accounting():
 
 def test_bridge_local_diagnostics_include_icy_and_version():
     row = app._check_bridge_local()
-    assert row["version"] == "5.6.11"
+    assert row["version"] == "5.6.12"
     assert "icy_metadata_enabled" in row
     assert "icy_metaint" in row
 
@@ -563,6 +563,49 @@ def test_coalesces_tiny_ffmpeg_reads_without_changing_bytes():
         out = [item async for item in app.coalesce_audio_chunks(src(), target_bytes=8, max_delay_seconds=60)]
         assert out == [(b"abcdefgh", True), (b"ij", True)]
         assert b"".join(chunk for chunk, _ in out) == b"abcdefghij"
+
+    asyncio.run(run())
+
+
+def test_coalescer_flushes_partial_chunk_on_real_timer_without_new_source_data():
+    async def run():
+        second_chunk_released = asyncio.Event()
+
+        async def src():
+            yield b"abc", True
+            await asyncio.sleep(0.20)
+            second_chunk_released.set()
+            yield b"def", True
+
+        gen = app.coalesce_audio_chunks(src(), target_bytes=8192, max_delay_seconds=0.03)
+        started = app.time.monotonic()
+        first = await asyncio.wait_for(anext(gen), timeout=0.10)
+        elapsed = app.time.monotonic() - started
+        assert first == (b"abc", True)
+        assert elapsed < 0.10
+        assert not second_chunk_released.is_set()
+        second = await asyncio.wait_for(anext(gen), timeout=0.30)
+        assert second == (b"def", True)
+        await gen.aclose()
+
+    asyncio.run(run())
+
+
+def test_stream_hub_reports_real_chunk_gap_diagnostics():
+    async def run():
+        ch = Channel(channel_id="xc-gap", name="Gap Test", source_url="http://example.test/live.ts")
+        hub = app.SharedStreamHub(ch, "mp3")
+        await hub._broadcast(b"A" * 100, real_audio=True)
+        # Simulate a 5.5 second upstream/output gap without slowing the test.
+        hub._last_real_chunk_monotonic -= 5.5
+        await hub._broadcast(b"B" * 100, real_audio=True)
+        status = hub.status()
+        assert status["max_real_chunk_gap_seconds"] >= 5.4
+        assert status["avg_real_chunk_gap_seconds"] >= 5.4
+        assert status["real_chunk_gap_over_1s_count"] == 1
+        assert status["real_chunk_gap_over_3s_count"] == 1
+        assert status["real_chunk_gap_over_5s_count"] == 1
+        assert status["real_chunk_gap_over_10s_count"] == 0
 
     asyncio.run(run())
 
