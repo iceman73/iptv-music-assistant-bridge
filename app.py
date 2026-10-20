@@ -25,7 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("dispatcharr-ma-bridge")
 
 APP_NAME = "Dispatcharr / XC Music Assistant Bridge"
-APP_VERSION = "6.0.0"
+APP_VERSION = "6.0.1"
 SOURCE_MODE = os.getenv("SOURCE_MODE", "dispatcharr").strip().lower()
 
 DISPATCHARR_BASE_URL = os.getenv("DISPATCHARR_BASE_URL", "http://dispatcharr:9191").rstrip("/")
@@ -671,6 +671,10 @@ class SharedStreamHub:
         self.upstream_http_error_count = 0
         self.current_attempt_http_503_count = 0
         self.current_attempt_http_error_count = 0
+        self.ffmpeg_timestamp_warning_count = 0
+        self.ffmpeg_timestamp_discontinuity_count = 0
+        self.current_attempt_timestamp_warning_count = 0
+        self.current_attempt_timestamp_discontinuity_count = 0
         self.current_attempt_number = 0
         self.current_attempt_started_at = ""
         self.state = "idle"
@@ -686,6 +690,8 @@ class SharedStreamHub:
         self.current_attempt_started_at = utc_now_iso()
         self.current_attempt_http_503_count = 0
         self.current_attempt_http_error_count = 0
+        self.current_attempt_timestamp_warning_count = 0
+        self.current_attempt_timestamp_discontinuity_count = 0
         self.last_error = ""
         self.last_chunk_at = ""
         self.last_real_chunk_at = ""
@@ -720,6 +726,12 @@ class SharedStreamHub:
             self.upstream_http_error_count += 1
             self.current_attempt_http_error_count += 1
             self.state = "source_error"
+        elif event == "timestamp_warning":
+            self.ffmpeg_timestamp_warning_count += 1
+            self.current_attempt_timestamp_warning_count += 1
+        elif event == "timestamp_discontinuity":
+            self.ffmpeg_timestamp_discontinuity_count += 1
+            self.current_attempt_timestamp_discontinuity_count += 1
 
     def _cancel_linger_locked(self) -> None:
         if self.linger_task and not self.linger_task.done():
@@ -1114,6 +1126,11 @@ class SharedStreamHub:
             "ring_buffer_chunks": len(self._ring_buffer),
             "upstream_http_503_count": self.upstream_http_503_count,
             "upstream_http_error_count": self.upstream_http_error_count,
+            "ffmpeg_audio_filter": "aresample=async=1:first_pts=0" if self.fmt == "mp3" else "transcode-only",
+            "ffmpeg_timestamp_warning_count": self.ffmpeg_timestamp_warning_count,
+            "ffmpeg_timestamp_discontinuity_count": self.ffmpeg_timestamp_discontinuity_count,
+            "current_attempt_timestamp_warning_count": self.current_attempt_timestamp_warning_count,
+            "current_attempt_timestamp_discontinuity_count": self.current_attempt_timestamp_discontinuity_count,
             "dropped_chunks": self.dropped_chunks,
             "slow_subscriber_disconnects": self.slow_subscriber_disconnects,
             "restart_count": self.restart_count,
@@ -2258,7 +2275,7 @@ async def lifespan(app: FastAPI):
         await stream_manager.stop()
 
 
-app = FastAPI(title=APP_NAME, version="5.6.10", lifespan=lifespan)
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
 
 def _channel_source_url(channel: Channel) -> str:
@@ -2346,16 +2363,33 @@ def build_ffmpeg_command(channel: Channel, fmt: str, source_codec: str = "", for
             return common + ["-c:a", "copy", "-f", "adts", "pipe:1"]
         # Reliable fallback for MP2/AC3/E-AC3/unknown XC sources.
         return common + [
+            "-af", "aresample=async=1:first_pts=0",
             "-ac", CHANNELS, "-ar", SAMPLE_RATE,
             "-c:a", "aac", "-b:a", AAC_BITRATE, "-f", "adts", "pipe:1"
         ]
     if fmt == "mp3":
         return common + [
+            "-af", "aresample=async=1:first_pts=0",
             "-ac", CHANNELS, "-ar", SAMPLE_RATE,
             "-c:a", "libmp3lame", "-b:a", MP3_BITRATE,
             "-write_xing", "0", "-id3v2_version", "0", "-f", "mp3", "pipe:1"
         ]
     raise ValueError(f"Unsupported format: {fmt}")
+
+
+def _ffmpeg_timing_diagnostic(raw: str) -> str:
+    """Classify FFmpeg timing warnings that can correlate with audible stutter."""
+    text = raw.casefold()
+    if "discontinuity" in text:
+        return "timestamp_discontinuity"
+    if (
+        "non-monoton" in text
+        or "non monoton" in text
+        or "backward in time" in text
+        or "timestamps are unset" in text
+    ):
+        return "timestamp_warning"
+    return ""
 
 
 async def _drain_stderr(stream: asyncio.StreamReader | None, channel_id: str, diagnostic_callback=None) -> None:
@@ -2377,6 +2411,9 @@ async def _drain_stderr(stream: asyncio.StreamReader | None, channel_id: str, di
                 diagnostic_callback("http_503")
             elif "HTTP error" in raw:
                 diagnostic_callback("http_error")
+            timing_event = _ffmpeg_timing_diagnostic(raw)
+            if timing_event:
+                diagnostic_callback(timing_event)
         LOGGER.warning("ffmpeg[%s]: %s", channel_id[:8], safe)
 
 
@@ -2435,7 +2472,7 @@ async def ffmpeg_audio_stream(channel: Channel, fmt: str, force_transcode: bool 
             except asyncio.CancelledError:
                 pass
         _upstream_semaphore.release()
-        LOGGER.info("Stopped v5 stream for channel %s", channel_id)
+        LOGGER.info("Stopped v6 stream for channel %s", channel_id)
 
 
 async def ffmpeg_silence_stream(fmt: str) -> AsyncIterator[bytes]:
@@ -2884,6 +2921,7 @@ async def health():
             "stream_coalesce_max_seconds": STREAM_COALESCE_MAX_SECONDS,
             "stream_ring_buffer_seconds": STREAM_RING_BUFFER_SECONDS,
             "ffmpeg_readrate": 1.0,
+            "ffmpeg_transcode_audio_filter": "aresample=async=1:first_pts=0",
             "stream_restart_delay": STREAM_RESTART_DELAY,
             "upstream_max_connections": UPSTREAM_MAX_CONNECTIONS,
             "ma_import_release_grace_seconds": MA_IMPORT_RELEASE_GRACE_SECONDS,

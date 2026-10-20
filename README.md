@@ -2,9 +2,9 @@
 
 A Docker bridge that turns Dispatcharr or Xtream Codes audio channels into stable radio streams for Music Assistant. The default path is tuned for Amazon Echo playback.
 
-**Current release: v6.0.0**
+**Current release: v6.0.1**
 
-v6 is a cleanup release based on the playback path validated in v5.6.13. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, and post-start silence gap-fill experiments have been removed. FFmpeg now owns media timing and reconnect behavior.
+v6 is based on the playback path validated in v5.6.13. v6.0.1 adds FFmpeg audio timestamp smoothing on transcoded streams with `aresample=async=1:first_pts=0`, aimed at brief source-timestamp discontinuities around program transitions. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, and post-start silence gap-fill experiments remain removed.
 
 ## Architecture
 
@@ -36,6 +36,7 @@ FFmpeg consumes the timestamped MPEG-TS source at media rate before encoding MP3
 - Persistent FFmpeg per active channel
 - FFmpeg reconnect handling
 - FFmpeg `-readrate 1` input pacing
+- FFmpeg async audio timestamp smoothing on transcoded MP3/AAC
 - Shared channel/format hubs
 - 8 KB write coalescing with a real 500 ms timer
 - 30-second hot-stream linger
@@ -356,6 +357,11 @@ avg_chunk_bytes
 coalesce_bytes
 coalesce_max_seconds
 ffmpeg_readrate
+ffmpeg_audio_filter
+ffmpeg_timestamp_warning_count
+ffmpeg_timestamp_discontinuity_count
+current_attempt_timestamp_warning_count
+current_attempt_timestamp_discontinuity_count
 ring_buffer_seconds
 dropped_chunks
 slow_subscriber_disconnects
@@ -507,3 +513,14 @@ For playback changes, validate `/streams` and `/api/checks/stream/<channel-id>` 
 ## License
 
 Apache License 2.0. See `LICENSE` and `NOTICE`.
+
+
+### v6.0.1 DJ/talk transition diagnostics
+
+v6.0.1 keeps the validated v6 stream architecture and adds only an FFmpeg-side audio timing correction stage for transcoded audio:
+
+```text
+-af aresample=async=1:first_pts=0
+```
+
+AAC stream-copy mode is unchanged. `/streams` now exposes FFmpeg timestamp warning and discontinuity counters so audible stutters can be correlated with source-timeline problems rather than inferred from bitrate alone.

@@ -1016,3 +1016,44 @@ def test_health_publishes_bridge_version():
     payload = asyncio.run(app.health())
     assert payload["status"] == "ok"
     assert payload["version"] == app.APP_VERSION
+
+
+def test_v601_transcodes_use_async_aresample_but_aac_copy_does_not():
+    ch = Channel(channel_id="xc-v601", name="Timing", source_url="http://example.test/live.ts")
+
+    mp3 = app.build_ffmpeg_command(ch, "mp3")
+    assert "-af" in mp3
+    assert mp3[mp3.index("-af") + 1] == "aresample=async=1:first_pts=0"
+
+    aac_transcode = app.build_ffmpeg_command(ch, "aac", source_codec="aac", force_transcode=True)
+    assert "-af" in aac_transcode
+    assert aac_transcode[aac_transcode.index("-af") + 1] == "aresample=async=1:first_pts=0"
+
+    old_mode = app.AAC_MODE
+    try:
+        app.AAC_MODE = "copy"
+        aac_copy = app.build_ffmpeg_command(ch, "aac", source_codec="aac")
+        assert "-af" not in aac_copy
+        assert aac_copy[aac_copy.index("-c:a") + 1] == "copy"
+    finally:
+        app.AAC_MODE = old_mode
+
+
+def test_ffmpeg_timing_warning_classifier():
+    assert app._ffmpeg_timing_diagnostic("Non-monotonous DTS in output stream") == "timestamp_warning"
+    assert app._ffmpeg_timing_diagnostic("Queue input is backward in time") == "timestamp_warning"
+    assert app._ffmpeg_timing_diagnostic("timestamp discontinuity detected") == "timestamp_discontinuity"
+    assert app._ffmpeg_timing_diagnostic("normal ffmpeg status") == ""
+
+
+def test_stream_hub_tracks_ffmpeg_timing_diagnostics():
+    hub = app.SharedStreamHub(Channel(channel_id="xc-time", name="Timing"), "mp3")
+    hub._reset_attempt_diagnostics()
+    hub.record_upstream_event("timestamp_warning")
+    hub.record_upstream_event("timestamp_discontinuity")
+    status = hub.status()
+    assert status["ffmpeg_timestamp_warning_count"] == 1
+    assert status["ffmpeg_timestamp_discontinuity_count"] == 1
+    assert status["current_attempt_timestamp_warning_count"] == 1
+    assert status["current_attempt_timestamp_discontinuity_count"] == 1
+    assert status["ffmpeg_audio_filter"] == "aresample=async=1:first_pts=0"
