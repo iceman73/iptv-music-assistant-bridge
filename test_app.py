@@ -1046,3 +1046,21 @@ def test_v602_restores_validated_transcode_path_without_async_aresample():
 
     aac_transcode = app.build_ffmpeg_command(ch, "aac", source_codec="aac", force_transcode=True)
     assert "-af" not in aac_transcode
+
+
+def test_v603_hub_status_exposes_last_source_probe_without_changing_playback():
+    hub = app.SharedStreamHub(Channel(channel_id="xc-probe", name="Probe"), "mp3")
+    assert hub.status()["source_probe"] is None
+    hub.last_source_probe = {
+        "status": "ok",
+        "max_source_chunk_gap_seconds": 0.25,
+        "effective_max_source_chunk_gap_seconds": 0.25,
+    }
+    status = hub.status()
+    assert status["source_probe"]["max_source_chunk_gap_seconds"] == 0.25
+    assert status["ffmpeg_readrate"] == 1.0
+
+
+def test_v603_source_probe_constants_are_bounded():
+    assert app.SOURCE_PROBE_MAX_SECONDS == 30.0
+    assert app.SOURCE_PROBE_CHUNK_BYTES == 16384

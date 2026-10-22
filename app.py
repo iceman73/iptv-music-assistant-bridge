@@ -25,7 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("dispatcharr-ma-bridge")
 
 APP_NAME = "Dispatcharr / XC Music Assistant Bridge"
-APP_VERSION = "6.0.2"
+APP_VERSION = "6.0.3"
 SOURCE_MODE = os.getenv("SOURCE_MODE", "dispatcharr").strip().lower()
 
 DISPATCHARR_BASE_URL = os.getenv("DISPATCHARR_BASE_URL", "http://dispatcharr:9191").rstrip("/")
@@ -45,6 +45,8 @@ DISPATCHARR_USER_AGENT = os.getenv("DISPATCHARR_USER_AGENT", f"Dispatcharr-MA-Br
 AAC_MODE = os.getenv("AAC_MODE", "auto").strip().lower()
 AAC_PROBE_TIMEOUT = max(2.0, float(os.getenv("AAC_PROBE_TIMEOUT", "30")))
 AUDIO_CODEC_CACHE_SECONDS = max(60, int(os.getenv("AUDIO_CODEC_CACHE_SECONDS", "86400")))
+SOURCE_PROBE_MAX_SECONDS = 30.0
+SOURCE_PROBE_CHUNK_BYTES = 16384
 
 # Xtream Codes / XC source settings.  In XC mode the bridge authenticates to
 # player_api.php, reads live categories and live streams, then constructs the
@@ -680,6 +682,9 @@ class SharedStreamHub:
         self.state = "idle"
         self.waiting_for_upstream_slot = False
         self._ring_buffer: deque[tuple[float, bytes]] = deque()
+        # Result from the most recent on-demand raw source delivery probe.
+        # This is passive telemetry and never changes the active playback path.
+        self.last_source_probe: dict[str, Any] | None = None
 
     @property
     def key(self) -> str:
@@ -1122,6 +1127,7 @@ class SharedStreamHub:
             "coalesce_bytes": STREAM_COALESCE_BYTES,
             "coalesce_max_seconds": STREAM_COALESCE_MAX_SECONDS,
             "ffmpeg_readrate": 1.0,
+            "source_probe": self.last_source_probe,
             "ring_buffer_seconds": STREAM_RING_BUFFER_SECONDS,
             "ring_buffer_chunks": len(self._ring_buffer),
             "upstream_http_503_count": self.upstream_http_503_count,
@@ -2334,6 +2340,122 @@ async def probe_audio_codec(channel: Channel, force: bool = False) -> str:
     return codec
 
 
+async def probe_source_delivery(channel: Channel, duration_seconds: float) -> dict[str, Any]:
+    """Measure raw source-byte arrival timing without altering the playback hub.
+
+    This opens a separate, short-lived HTTP connection to the Dispatcharr/XC
+    source. It is intentionally on-demand so normal playback keeps the validated
+    v6.0.2 data path unchanged.
+    """
+    requested = max(0.1, min(float(duration_seconds), SOURCE_PROBE_MAX_SECONDS))
+    source = _channel_source_url(channel)
+    started = time.monotonic()
+    first_byte_at = 0.0
+    last_chunk_at = 0.0
+    max_gap = 0.0
+    gap_total = 0.0
+    gap_count = 0
+    over_1s = over_3s = over_5s = over_10s = 0
+    total_bytes = 0
+    total_chunks = 0
+    http_status = 0
+    content_type = ""
+    ended_early = False
+
+    timeout = httpx.Timeout(
+        connect=min(10.0, SOURCE_RW_TIMEOUT_SECONDS),
+        read=max(SOURCE_RW_TIMEOUT_SECONDS, requested + 5.0),
+        write=10.0,
+        pool=10.0,
+    )
+    headers = {"User-Agent": DISPATCHARR_USER_AGENT}
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers=headers,
+            verify=XC_VERIFY_SSL if SOURCE_MODE == "xc" else True,
+        ) as client:
+            async with client.stream("GET", source) as response:
+                http_status = response.status_code
+                content_type = response.headers.get("content-type", "")
+                response.raise_for_status()
+                iterator = response.aiter_bytes(SOURCE_PROBE_CHUNK_BYTES).__aiter__()
+
+                while True:
+                    remaining = requested - (time.monotonic() - started)
+                    if remaining <= 0:
+                        break
+                    try:
+                        chunk = await asyncio.wait_for(anext(iterator), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    except StopAsyncIteration:
+                        ended_early = True
+                        break
+                    if not chunk:
+                        continue
+
+                    now = time.monotonic()
+                    if not first_byte_at:
+                        first_byte_at = now
+                    if last_chunk_at:
+                        gap = max(0.0, now - last_chunk_at)
+                        gap_total += gap
+                        gap_count += 1
+                        max_gap = max(max_gap, gap)
+                        if gap > 1.0:
+                            over_1s += 1
+                        if gap > 3.0:
+                            over_3s += 1
+                        if gap > 5.0:
+                            over_5s += 1
+                        if gap > 10.0:
+                            over_10s += 1
+                    last_chunk_at = now
+                    total_bytes += len(chunk)
+                    total_chunks += 1
+    except Exception as exc:
+        elapsed = max(0.0, time.monotonic() - started)
+        return {
+            "status": "fail",
+            "sampled_at": utc_now_iso(),
+            "requested_seconds": round(requested, 3),
+            "elapsed_seconds": round(elapsed, 3),
+            "http_status": http_status or None,
+            "error": redact_secrets(exc),
+        }
+
+    finished = time.monotonic()
+    elapsed = max(0.0, finished - started)
+    trailing_gap = max(0.0, finished - last_chunk_at) if last_chunk_at else elapsed
+    effective_max_gap = max(max_gap, trailing_gap)
+    bytes_per_second = (total_bytes / elapsed) if elapsed > 0 else 0.0
+    return {
+        "status": "ok",
+        "sampled_at": utc_now_iso(),
+        "requested_seconds": round(requested, 3),
+        "elapsed_seconds": round(elapsed, 3),
+        "http_status": http_status,
+        "content_type": content_type,
+        "ended_early": ended_early,
+        "first_byte_ms": round((first_byte_at - started) * 1000, 1) if first_byte_at else None,
+        "total_source_bytes": total_bytes,
+        "source_chunks": total_chunks,
+        "avg_source_chunk_bytes": round(total_bytes / total_chunks, 1) if total_chunks else 0.0,
+        "source_bytes_per_second": round(bytes_per_second, 1),
+        "source_kbps": round((bytes_per_second * 8) / 1000, 1),
+        "max_source_chunk_gap_seconds": round(max_gap, 3),
+        "effective_max_source_chunk_gap_seconds": round(effective_max_gap, 3),
+        "avg_source_chunk_gap_seconds": round(gap_total / gap_count, 3) if gap_count else 0.0,
+        "source_chunk_gap_over_1s_count": over_1s,
+        "source_chunk_gap_over_3s_count": over_3s,
+        "source_chunk_gap_over_5s_count": over_5s,
+        "source_chunk_gap_over_10s_count": over_10s,
+    }
+
+
 _upstream_semaphore = asyncio.Semaphore(UPSTREAM_MAX_CONNECTIONS)
 
 
@@ -3003,7 +3125,11 @@ async def api_checks_run():
 
 
 @app.get("/api/checks/stream/{channel_id}")
-async def api_check_stream(channel_id: str, live: bool = Query(False)):
+async def api_check_stream(
+    channel_id: str,
+    live: bool = Query(False),
+    source_probe_seconds: float = Query(0.0, ge=0.0, le=SOURCE_PROBE_MAX_SECONDS),
+):
     channel = await catalog.get(channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Channel is not present in the filtered source catalog")
@@ -3011,9 +3137,20 @@ async def api_check_stream(channel_id: str, live: bool = Query(False)):
         "status": "ok", "channel_id": channel.channel_id, "name": channel.name, "source_mode": SOURCE_MODE,
         "metadata": metadata_service.get(channel).public_dict() if metadata_service.get(channel) else None,
         "live_test_requested": live,
+        "source_probe_seconds": source_probe_seconds,
     }
     active = [row for row in stream_manager.status().get("hubs", []) if row.get("channel_id") == channel_id]
     result["active_hubs"] = active
+
+    if source_probe_seconds > 0:
+        probe = await probe_source_delivery(channel, source_probe_seconds)
+        result["source_probe"] = probe
+        for hub in stream_manager.hubs.values():
+            if hub.channel.channel_id == channel_id:
+                hub.last_source_probe = probe
+        if probe.get("status") != "ok":
+            result["status"] = "fail"
+
     if not live:
         result["live_test"] = "not_run; add ?live=true to open/warm the source"
         return result

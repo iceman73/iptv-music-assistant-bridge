@@ -2,7 +2,7 @@
 
 A Docker bridge that turns Dispatcharr or Xtream Codes audio channels into stable radio streams for Music Assistant. The default path is tuned for Amazon Echo playback.
 
-**Current release: v6.0.2**
+**Current release: v6.0.3**
 
 v6 is based on the playback path validated in v5.6.13. v6.0.2 restores that validated FFmpeg/transcode path after the v6.0.1 async-resample experiment caused renewed stuttering. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, post-start silence gap-fill, and async-resample experiment are not part of the active playback path.
 
@@ -148,6 +148,29 @@ Use an audio-only profile similar to:
 ```
 
 The bridge then opens that MPEG-TS source with its own persistent FFmpeg process and adds `-readrate 1` before `-i`.
+
+## Raw source delivery probe
+
+v6.0.3 adds an on-demand, passive source timing probe. It opens a separate
+short-lived connection to the Dispatcharr/XC stream and measures raw byte-arrival
+gaps without changing the active FFmpeg/MP3 playback path.
+
+Run a 15-second source probe for a channel:
+
+```bash
+curl -s "http://YOUR-BRIDGE-HOST:8088/api/checks/stream/xc-23245?source_probe_seconds=15" | jq
+```
+
+The probe is capped at 30 seconds. Important fields are
+`max_source_chunk_gap_seconds`, `effective_max_source_chunk_gap_seconds`,
+the `source_chunk_gap_over_*_count` counters, `source_kbps`, and
+`first_byte_ms`. When the channel also has an active bridge hub, the most
+recent result is copied into that hub's `source_probe` field in `/streams`.
+This lets you compare raw source delivery gaps with
+`max_real_chunk_gap_seconds` from FFmpeg output.
+
+Because the diagnostic opens a second source connection, use it only while
+troubleshooting and account for any upstream provider connection limits.
 
 ## Source configuration
 
