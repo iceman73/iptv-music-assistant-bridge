@@ -25,7 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("dispatcharr-ma-bridge")
 
 APP_NAME = "Dispatcharr / XC Music Assistant Bridge"
-APP_VERSION = "6.0.1"
+APP_VERSION = "6.0.2"
 SOURCE_MODE = os.getenv("SOURCE_MODE", "dispatcharr").strip().lower()
 
 DISPATCHARR_BASE_URL = os.getenv("DISPATCHARR_BASE_URL", "http://dispatcharr:9191").rstrip("/")
@@ -1126,7 +1126,6 @@ class SharedStreamHub:
             "ring_buffer_chunks": len(self._ring_buffer),
             "upstream_http_503_count": self.upstream_http_503_count,
             "upstream_http_error_count": self.upstream_http_error_count,
-            "ffmpeg_audio_filter": "aresample=async=1:first_pts=0" if self.fmt == "mp3" else "transcode-only",
             "ffmpeg_timestamp_warning_count": self.ffmpeg_timestamp_warning_count,
             "ffmpeg_timestamp_discontinuity_count": self.ffmpeg_timestamp_discontinuity_count,
             "current_attempt_timestamp_warning_count": self.current_attempt_timestamp_warning_count,
@@ -2363,13 +2362,11 @@ def build_ffmpeg_command(channel: Channel, fmt: str, source_codec: str = "", for
             return common + ["-c:a", "copy", "-f", "adts", "pipe:1"]
         # Reliable fallback for MP2/AC3/E-AC3/unknown XC sources.
         return common + [
-            "-af", "aresample=async=1:first_pts=0",
             "-ac", CHANNELS, "-ar", SAMPLE_RATE,
             "-c:a", "aac", "-b:a", AAC_BITRATE, "-f", "adts", "pipe:1"
         ]
     if fmt == "mp3":
         return common + [
-            "-af", "aresample=async=1:first_pts=0",
             "-ac", CHANNELS, "-ar", SAMPLE_RATE,
             "-c:a", "libmp3lame", "-b:a", MP3_BITRATE,
             "-write_xing", "0", "-id3v2_version", "0", "-f", "mp3", "pipe:1"
@@ -2921,7 +2918,6 @@ async def health():
             "stream_coalesce_max_seconds": STREAM_COALESCE_MAX_SECONDS,
             "stream_ring_buffer_seconds": STREAM_RING_BUFFER_SECONDS,
             "ffmpeg_readrate": 1.0,
-            "ffmpeg_transcode_audio_filter": "aresample=async=1:first_pts=0",
             "stream_restart_delay": STREAM_RESTART_DELAY,
             "upstream_max_connections": UPSTREAM_MAX_CONNECTIONS,
             "ma_import_release_grace_seconds": MA_IMPORT_RELEASE_GRACE_SECONDS,

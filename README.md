@@ -2,9 +2,9 @@
 
 A Docker bridge that turns Dispatcharr or Xtream Codes audio channels into stable radio streams for Music Assistant. The default path is tuned for Amazon Echo playback.
 
-**Current release: v6.0.1**
+**Current release: v6.0.2**
 
-v6 is based on the playback path validated in v5.6.13. v6.0.1 adds FFmpeg audio timestamp smoothing on transcoded streams with `aresample=async=1:first_pts=0`, aimed at brief source-timestamp discontinuities around program transitions. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, and post-start silence gap-fill experiments remain removed.
+v6 is based on the playback path validated in v5.6.13. v6.0.2 restores that validated FFmpeg/transcode path after the v6.0.1 async-resample experiment caused renewed stuttering. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, post-start silence gap-fill, and async-resample experiment are not part of the active playback path.
 
 ## Architecture
 
@@ -36,7 +36,6 @@ FFmpeg consumes the timestamped MPEG-TS source at media rate before encoding MP3
 - Persistent FFmpeg per active channel
 - FFmpeg reconnect handling
 - FFmpeg `-readrate 1` input pacing
-- FFmpeg async audio timestamp smoothing on transcoded MP3/AAC
 - Shared channel/format hubs
 - 8 KB write coalescing with a real 500 ms timer
 - 30-second hot-stream linger
@@ -357,7 +356,6 @@ avg_chunk_bytes
 coalesce_bytes
 coalesce_max_seconds
 ffmpeg_readrate
-ffmpeg_audio_filter
 ffmpeg_timestamp_warning_count
 ffmpeg_timestamp_discontinuity_count
 current_attempt_timestamp_warning_count
@@ -524,3 +522,25 @@ v6.0.1 keeps the validated v6 stream architecture and adds only an FFmpeg-side a
 ```
 
 AAC stream-copy mode is unchanged. `/streams` now exposes FFmpeg timestamp warning and discontinuity counters so audible stutters can be correlated with source-timeline problems rather than inferred from bitrate alone.
+
+
+### v6.0.2 rollback to validated playback path
+
+v6.0.2 removes the v6.0.1 `aresample=async=1:first_pts=0` filter after renewed stuttering was observed. The active playback path is again the architecture validated in v5.6.13:
+
+```text
+Dispatcharr / XC MPEG-TS
+        ↓
+Persistent FFmpeg
+reconnect + -readrate 1
+        ↓
+MP3 192k
+        ↓
+8 KB coalescer / 500 ms flush
+        ↓
+Shared hub
+        ↓
+Music Assistant / Echo
+```
+
+The FFmpeg timing-warning counters remain available in `/streams` for diagnostics, but they do not alter playback.
