@@ -226,7 +226,7 @@ def test_ma_sync_skips_unchanged_and_only_imports_new_station():
         ch_new = Channel(channel_id="xc-2", name="PopRocks", source_url="http://example.test/2.ts")
         existing_item = {
             "item_id": "1",
-            "name": "The Pulse",
+            "name": "SXM - The Pulse",
             "provider_mappings": [{
                 "provider_domain": "builtin",
                 "provider_instance": "builtin",
@@ -240,7 +240,12 @@ def test_ma_sync_skips_unchanged_and_only_imports_new_station():
             added.append((channel.name, args["url"]))
         service._managed_library_radios = fake_managed
         service._add_radio_with_warm_source = fake_add
-        result = await service.sync([ch_existing, ch_new], reason="test")
+        old_genre = app.MA_GENRE_ENABLED
+        try:
+            app.MA_GENRE_ENABLED = False
+            result = await service.sync([ch_existing, ch_new], reason="test")
+        finally:
+            app.MA_GENRE_ENABLED = old_genre
         assert result["unchanged_count"] == 1
         assert result["synced_count"] == 1
         assert added == [("PopRocks", ch_new.bridge_url(app.IMPORT_FORMAT))]
@@ -587,8 +592,10 @@ def test_ma_sync_migrates_old_format_when_remove_missing_is_off():
         old_remove = app.MA_REMOVE_MISSING
         old_prefix = app.MA_MANAGED_URL_PREFIX
         old_public = app.PUBLIC_BASE_URL
+        old_genre = app.MA_GENRE_ENABLED
         try:
             app.IMPORT_FORMAT = "mp3"
+            app.MA_GENRE_ENABLED = False
             app.MA_REMOVE_MISSING = False
             app.MA_MANAGED_URL_PREFIX = "http://bridge:8088/stream/"
             app.PUBLIC_BASE_URL = "http://bridge:8088"
@@ -625,6 +632,7 @@ def test_ma_sync_migrates_old_format_when_remove_missing_is_off():
             app.MA_REMOVE_MISSING = old_remove
             app.MA_MANAGED_URL_PREFIX = old_prefix
             app.PUBLIC_BASE_URL = old_public
+            app.MA_GENRE_ENABLED = old_genre
     asyncio.run(run())
 
 def test_shared_hub_current_attempt_diagnostics_reset_cleanly():
