@@ -2,7 +2,7 @@
 
 A Docker bridge that turns Dispatcharr or Xtream Codes audio channels into stable radio streams for Music Assistant. The default path is tuned for Amazon Echo playback.
 
-**Current release: v6.0.3**
+**Current release: v6.1.0**
 
 v6 is based on the playback path validated in v5.6.13. v6.0.2 restores that validated FFmpeg/transcode path after the v6.0.1 async-resample experiment caused renewed stuttering. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, post-start silence gap-fill, and async-resample experiment are not part of the active playback path.
 
@@ -283,6 +283,25 @@ The bridge stores its persistent cache at `/data/bridge-cache.json`.
 | `TICKER_ACTIVE_POLL_SECONDS` | `15` | Poll rate while bridge streams are active |
 | `TICKER_IDLE_POLL_SECONDS` | `0` | Ticker polling while no bridge stream is active |
 | `XMPLAYLIST_POLL_SECONDS` | `120` | xmplaylist refresh interval |
+
+### Music Assistant naming and genre
+
+v6.1.0 can automatically organize bridge-managed radios in Music Assistant.
+
+By default:
+- managed radio names are prefixed with `SXM - `
+- the bridge creates or finds the `SiriusXM` music genre
+- every current bridge-managed radio is linked to that genre on sync
+
+These affect Music Assistant only; Dispatcharr and bridge catalog channel names are unchanged.
+
+```env
+MA_NAME_PREFIX=SXM -
+MA_GENRE_ENABLED=true
+MA_GENRE_NAME=SiriusXM
+```
+
+Set `MA_NAME_PREFIX=` to disable the prefix or `MA_GENRE_ENABLED=false` to disable genre linking.
 
 ### Music Assistant
 

@@ -1064,3 +1064,106 @@ def test_v603_hub_status_exposes_last_source_probe_without_changing_playback():
 def test_v603_source_probe_constants_are_bounded():
     assert app.SOURCE_PROBE_MAX_SECONDS == 30.0
     assert app.SOURCE_PROBE_CHUNK_BYTES == 16384
+
+
+def test_v610_ma_radio_name_prefix():
+    ch = Channel(channel_id="xc-9", name="90s on 9")
+    old_prefix = app.MA_NAME_PREFIX
+    try:
+        app.MA_NAME_PREFIX = "SXM - "
+        assert app.MusicAssistantSyncService._ma_radio_name(ch) == "SXM - 90s on 9"
+        already = Channel(channel_id="xc-10", name="SXM - Classic Vinyl")
+        assert app.MusicAssistantSyncService._ma_radio_name(already) == "SXM - Classic Vinyl"
+        app.MA_NAME_PREFIX = ""
+        assert app.MusicAssistantSyncService._ma_radio_name(ch) == "90s on 9"
+    finally:
+        app.MA_NAME_PREFIX = old_prefix
+
+
+def test_v610_genre_is_created_when_missing():
+    async def run():
+        service = app.MusicAssistantSyncService()
+        calls = []
+
+        async def fake_call(command, args):
+            calls.append((command, args))
+            if command == "music/genres/library_items":
+                return []
+            if command == "music/genres/add":
+                return {"item_id": "42", "name": app.MA_GENRE_NAME}
+            raise AssertionError(command)
+
+        service._call = fake_call
+        genre = await service._ensure_genre()
+        assert genre["item_id"] == "42"
+        assert calls[0][0] == "music/genres/library_items"
+        assert calls[1][0] == "music/genres/add"
+        assert calls[1][1]["item"]["name"] == app.MA_GENRE_NAME
+        assert calls[1][1]["item"]["provider"] == "library"
+
+    asyncio.run(run())
+
+
+def test_v610_genre_links_only_desired_managed_radios():
+    async def run():
+        service = app.MusicAssistantSyncService()
+        old_enabled = app.MA_GENRE_ENABLED
+        old_name = app.MA_GENRE_NAME
+        old_prefix = app.MA_MANAGED_URL_PREFIX
+        app.MA_GENRE_ENABLED = True
+        app.MA_GENRE_NAME = "SiriusXM"
+        app.MA_MANAGED_URL_PREFIX = "http://localhost:8088/stream/"
+        mapped = []
+        try:
+            async def fake_ensure_genre():
+                return {"item_id": "77", "name": "SiriusXM"}
+
+            async def fake_managed():
+                return [
+                    {
+                        "item_id": "101",
+                        "name": "SXM - One",
+                        "provider_mappings": [{
+                            "provider_domain": "builtin",
+                            "provider_instance": "builtin",
+                            "item_id": "http://localhost:8088/stream/xc-1.mp3",
+                        }],
+                    },
+                    {
+                        "item_id": "102",
+                        "name": "SXM - Two",
+                        "provider_mappings": [{
+                            "provider_domain": "builtin",
+                            "provider_instance": "builtin",
+                            "item_id": "http://localhost:8088/stream/xc-2.mp3",
+                        }],
+                    },
+                ]
+
+            async def fake_call(command, args):
+                if command == "music/genres/add_media_mapping":
+                    mapped.append(args)
+                    return None
+                raise AssertionError(command)
+
+            service._ensure_genre = fake_ensure_genre
+            service._managed_library_radios = fake_managed
+            service._call = fake_call
+            genre_id, linked, failures = await service._link_managed_radios_to_genre(
+                {"http://localhost:8088/stream/xc-1.mp3"}
+            )
+            assert genre_id == "77"
+            assert linked == 1
+            assert failures == 0
+            assert mapped == [{
+                "genre_id": "77",
+                "media_type": "radio",
+                "media_id": "101",
+                "alias": "SiriusXM",
+            }]
+        finally:
+            app.MA_GENRE_ENABLED = old_enabled
+            app.MA_GENRE_NAME = old_name
+            app.MA_MANAGED_URL_PREFIX = old_prefix
+
+    asyncio.run(run())

@@ -25,7 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("dispatcharr-ma-bridge")
 
 APP_NAME = "Dispatcharr / XC Music Assistant Bridge"
-APP_VERSION = "6.0.3"
+APP_VERSION = "6.1.0"
 SOURCE_MODE = os.getenv("SOURCE_MODE", "dispatcharr").strip().lower()
 
 DISPATCHARR_BASE_URL = os.getenv("DISPATCHARR_BASE_URL", "http://dispatcharr:9191").rstrip("/")
@@ -92,6 +92,9 @@ MA_AUTO_SYNC = os.getenv("MA_AUTO_SYNC", "false").strip().lower() in {"1", "true
 MA_SYNC_ON_START = os.getenv("MA_SYNC_ON_START", "true").strip().lower() in {"1", "true", "yes", "on"}
 MA_SYNC_AFTER_CATALOG_REFRESH = os.getenv("MA_SYNC_AFTER_CATALOG_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 MA_REMOVE_MISSING = os.getenv("MA_REMOVE_MISSING", "false").strip().lower() in {"1", "true", "yes", "on"}
+MA_GENRE_ENABLED = os.getenv("MA_GENRE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+MA_GENRE_NAME = os.getenv("MA_GENRE_NAME", "SiriusXM").strip()
+MA_NAME_PREFIX = os.getenv("MA_NAME_PREFIX", "SXM - ").strip()
 MA_SYNC_RETRY_SECONDS = max(60, int(os.getenv("MA_SYNC_RETRY_SECONDS", "3600")))
 MA_SYNC_TIMEOUT = max(5.0, float(os.getenv("MA_SYNC_TIMEOUT", "90")))
 MA_ADD_RETRIES = max(1, int(os.getenv("MA_ADD_RETRIES", "3")))
@@ -1348,6 +1351,10 @@ class MusicAssistantSyncService:
         self.last_migrated_count = 0
         self.last_stale_format_removed_count = 0
         self.last_migration_failures = 0
+        self.last_genre_name = ""
+        self.last_genre_id = ""
+        self.last_genre_linked_count = 0
+        self.last_genre_link_failures = 0
 
     @property
     def enabled(self) -> bool:
@@ -1475,6 +1482,98 @@ class MusicAssistantSyncService:
                 break
             offset += limit
         return managed
+
+    @staticmethod
+    def _ma_radio_name(channel: Channel) -> str:
+        """Return the Music Assistant display name without changing source/catalog names."""
+        prefix = MA_NAME_PREFIX.strip()
+        if not prefix:
+            return channel.name
+        normalized = prefix.rstrip()
+        if channel.name.casefold().startswith(normalized.casefold()):
+            return channel.name
+        return f"{normalized} {channel.name}"
+
+    async def _ensure_genre(self) -> dict[str, Any]:
+        """Return the configured MA music genre, creating it if it does not exist."""
+        if not MA_GENRE_NAME:
+            raise RuntimeError("MA_GENRE_NAME is empty")
+        rows = await self._call(
+            "music/genres/library_items",
+            {
+                "search": MA_GENRE_NAME,
+                "limit": 100,
+                "offset": 0,
+                "hide_empty": False,
+                "content_type": "music",
+                "summary": False,
+            },
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("MA music/genres/library_items returned an unexpected response")
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("name") or "").strip().casefold() == MA_GENRE_NAME.casefold():
+                return row
+
+        created = await self._call(
+            "music/genres/add",
+            {
+                "item": {
+                    "item_id": "0",
+                    "provider": "library",
+                    "name": MA_GENRE_NAME,
+                    "provider_mappings": [],
+                },
+                "overwrite_existing": False,
+            },
+        )
+        if not isinstance(created, dict) or created.get("item_id") in (None, ""):
+            raise RuntimeError("MA music/genres/add returned an unexpected response")
+        return created
+
+    async def _link_managed_radios_to_genre(
+        self,
+        desired_urls: set[str],
+    ) -> tuple[str, int, int]:
+        """Link current bridge-managed radio library items to the configured genre."""
+        if not MA_GENRE_ENABLED:
+            return "", 0, 0
+        genre = await self._ensure_genre()
+        genre_id = str(genre.get("item_id") or "")
+        if not genre_id:
+            raise RuntimeError("Music Assistant genre is missing item_id")
+
+        managed = await self._managed_library_radios()
+        linked = 0
+        failures = 0
+        for item in managed:
+            url = self._managed_url_from_item(item)
+            if url not in desired_urls:
+                continue
+            media_id = item.get("item_id")
+            if media_id in (None, ""):
+                failures += 1
+                continue
+            try:
+                await self._call(
+                    "music/genres/add_media_mapping",
+                    {
+                        "genre_id": genre_id,
+                        "media_type": "radio",
+                        "media_id": media_id,
+                        "alias": MA_GENRE_NAME,
+                    },
+                )
+                linked += 1
+            except Exception as exc:
+                failures += 1
+                LOGGER.warning(
+                    "Could not link MA radio %s to genre %s: %s",
+                    _existing_radio_name(item),
+                    MA_GENRE_NAME,
+                    exception_detail(exc),
+                )
+        return genre_id, linked, failures
 
     async def audit_library_radios(self, channels: list[Channel]) -> dict[str, Any]:
         """Compare bridge-managed MA radios with the current bridge catalog."""
@@ -1719,11 +1818,12 @@ class MusicAssistantSyncService:
                     if self._managed_url_from_item(item) != url
                 ]
 
-                desired_ready = bool(existing and _existing_radio_name(existing) == channel.name)
+                ma_name = self._ma_radio_name(channel)
+                desired_ready = bool(existing and _existing_radio_name(existing) == ma_name)
                 if desired_ready:
                     unchanged += 1
                 else:
-                    args: dict[str, Any] = {"url": url, "name": channel.name}
+                    args: dict[str, Any] = {"url": url, "name": ma_name}
                     if IMPORT_LOGOS and channel.logo:
                         args["image_url"] = channel.logo
                     try:
@@ -1734,7 +1834,7 @@ class MusicAssistantSyncService:
                         add_failures += 1
                         if len(failed_radios) < 25:
                             failed_radios.append({"name": channel.name, "url": url, "error": exception_detail(exc)[:300]})
-                        LOGGER.warning("Could not add/update MA radio %s: %s", channel.name, exception_detail(exc))
+                        LOGGER.warning("Could not add/update MA radio %s: %s", ma_name, exception_detail(exc))
 
                 # Format migration is independent of MA_REMOVE_MISSING. Only remove
                 # the old format after the desired station is confirmed present so
@@ -1780,6 +1880,18 @@ class MusicAssistantSyncService:
                         remove_failures += 1
                         LOGGER.warning("Could not remove stale MA radio %s: %s", managed_url, exc)
 
+            genre_id = ""
+            genre_linked = 0
+            genre_link_failures = 0
+            if MA_GENRE_ENABLED:
+                try:
+                    genre_id, genre_linked, genre_link_failures = await self._link_managed_radios_to_genre(
+                        set(desired.keys())
+                    )
+                except Exception as exc:
+                    genre_link_failures += 1
+                    LOGGER.warning("Could not synchronize Music Assistant genre %s: %s", MA_GENRE_NAME, exc)
+
             self.last_synced_count = synced
             self.last_unchanged_count = unchanged
             self.last_add_failures = add_failures
@@ -1789,6 +1901,10 @@ class MusicAssistantSyncService:
             self.last_migrated_count = migrated
             self.last_stale_format_removed_count = stale_format_removed
             self.last_migration_failures = migration_failures
+            self.last_genre_name = MA_GENRE_NAME if MA_GENRE_ENABLED else ""
+            self.last_genre_id = genre_id
+            self.last_genre_linked_count = genre_linked
+            self.last_genre_link_failures = genre_link_failures
             self.last_sync_at = utc_now_iso()
             errors = []
             if add_failures:
@@ -1797,11 +1913,13 @@ class MusicAssistantSyncService:
                 errors.append(f"{migration_failures} format migration cleanup(s) failed")
             if remove_failures:
                 errors.append(f"{remove_failures} stale radio removal(s) failed")
+            if genre_link_failures:
+                errors.append(f"{genre_link_failures} genre link operation(s) failed")
             self.last_error = "; ".join(errors)
             LOGGER.info(
                 "Music Assistant sync complete: %d add/update, %d unchanged, %d add failure(s), "
                 "%d migrated, %d stale-format removed, %d migration failure(s), "
-                "%d missing removed, %d removal failure(s)",
+                "%d missing removed, %d removal failure(s), %d genre linked, %d genre failure(s)",
                 synced,
                 unchanged,
                 add_failures,
@@ -1810,6 +1928,8 @@ class MusicAssistantSyncService:
                 migration_failures,
                 removed,
                 remove_failures,
+                genre_linked,
+                genre_link_failures,
             )
             return self.status()
 
@@ -1820,6 +1940,12 @@ class MusicAssistantSyncService:
             "url": MUSIC_ASSISTANT_URL,
             "format": IMPORT_FORMAT,
             "remove_missing": MA_REMOVE_MISSING,
+            "name_prefix": MA_NAME_PREFIX,
+            "genre_enabled": MA_GENRE_ENABLED,
+            "genre_name": MA_GENRE_NAME,
+            "genre_id": self.last_genre_id,
+            "genre_linked_count": self.last_genre_linked_count,
+            "genre_link_failures": self.last_genre_link_failures,
             "managed_url_prefix": MA_MANAGED_URL_PREFIX,
             "warmup_enabled": STREAM_WARMUP_ENABLED,
             "warmup_timeout": STREAM_WARMUP_TIMEOUT,
