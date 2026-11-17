@@ -538,9 +538,9 @@ def test_coalescer_flushes_partial_chunk_on_real_timer_without_new_source_data()
             yield b"def", True
 
         gen = app.coalesce_audio_chunks(src(), target_bytes=8192, max_delay_seconds=0.03)
-        started = app.time.monotonic()
+        started = app.app.time.monotonic()
         first = await asyncio.wait_for(anext(gen), timeout=0.10)
-        elapsed = app.time.monotonic() - started
+        elapsed = app.app.time.monotonic() - started
         assert first == (b"abc", True)
         assert elapsed < 0.10
         assert not second_chunk_released.is_set()
@@ -1276,11 +1276,11 @@ def test_v612_metadata_delay_holds_new_song_until_due():
         channel = Channel(channel_id="xc-1", name="Classic Vinyl", channel_number="26")
         old_song = app.NowPlaying(
             provider="ticker", channel_name="Classic Vinyl", channel_number="26",
-            artist="Old Artist", title="Old Song", fetched_at=time.time(),
+            artist="Old Artist", title="Old Song", fetched_at=app.time.time(),
         )
         new_song = app.NowPlaying(
             provider="ticker", channel_name="Classic Vinyl", channel_number="26",
-            artist="New Artist", title="New Song", fetched_at=time.time(),
+            artist="New Artist", title="New Song", fetched_at=app.time.time(),
         )
 
         # Seed the currently published metadata, then queue the next provider snapshot.
@@ -1291,7 +1291,7 @@ def test_v612_metadata_delay_holds_new_song_until_due():
 
         # Make the queued snapshot due without sleeping in the test.
         _, items = service._pending_metadata.popleft()
-        service._pending_metadata.appendleft((time.monotonic() - 0.01, items))
+        service._pending_metadata.appendleft((app.time.monotonic() - 0.01, items))
         assert service.get(channel).title == "New Song"
         assert len(service._pending_metadata) == 0
     finally:
@@ -1306,7 +1306,7 @@ def test_v612_metadata_delay_zero_publishes_immediately():
         channel = Channel(channel_id="xc-1", name="Classic Vinyl", channel_number="26")
         song = app.NowPlaying(
             provider="ticker", channel_name="Classic Vinyl", channel_number="26",
-            artist="Artist", title="Song", fetched_at=time.time(),
+            artist="Artist", title="Song", fetched_at=app.time.time(),
         )
         service._replace_cache([song])
         assert service.get(channel).title == "Song"
