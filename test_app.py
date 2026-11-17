@@ -538,9 +538,9 @@ def test_coalescer_flushes_partial_chunk_on_real_timer_without_new_source_data()
             yield b"def", True
 
         gen = app.coalesce_audio_chunks(src(), target_bytes=8192, max_delay_seconds=0.03)
-        started = app.app.time.monotonic()
+        started = app.time.monotonic()
         first = await asyncio.wait_for(anext(gen), timeout=0.10)
-        elapsed = app.app.time.monotonic() - started
+        elapsed = app.time.monotonic() - started
         assert first == (b"abc", True)
         assert elapsed < 0.10
         assert not second_chunk_released.is_set()
