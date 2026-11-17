@@ -25,7 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("dispatcharr-ma-bridge")
 
 APP_NAME = "Dispatcharr / XC Music Assistant Bridge"
-APP_VERSION = "6.1.0"
+APP_VERSION = "6.1.1"
 SOURCE_MODE = os.getenv("SOURCE_MODE", "dispatcharr").strip().lower()
 
 DISPATCHARR_BASE_URL = os.getenv("DISPATCHARR_BASE_URL", "http://dispatcharr:9191").rstrip("/")
@@ -1464,6 +1464,25 @@ class MusicAssistantSyncService:
             {"item_id": library_id, "recursive": True},
         )
 
+    async def _rename_managed_radio_item(self, item: dict[str, Any], desired_name: str) -> None:
+        """Rename an existing MA library radio without recreating its provider mapping."""
+        library_id = item.get("item_id")
+        if library_id in (None, ""):
+            raise RuntimeError("Managed Music Assistant radio is missing item_id")
+        updated = dict(item)
+        updated["name"] = desired_name
+        # MA computes sort_name from name when it is omitted. Sending a stale sort_name
+        # can leave the UI sorted/displayed using the old station identity.
+        updated.pop("sort_name", None)
+        await self._call(
+            "music/radios/update",
+            {
+                "item_id": int(library_id),
+                "update": updated,
+                "overwrite": True,
+            },
+        )
+
     async def _managed_library_radios(self) -> list[dict[str, Any]]:
         managed: list[dict[str, Any]] = []
         offset = 0
@@ -1819,9 +1838,21 @@ class MusicAssistantSyncService:
                 ]
 
                 ma_name = self._ma_radio_name(channel)
-                desired_ready = bool(existing and _existing_radio_name(existing) == ma_name)
-                if desired_ready:
-                    unchanged += 1
+                desired_ready = False
+                if existing:
+                    if _existing_radio_name(existing) == ma_name:
+                        unchanged += 1
+                        desired_ready = True
+                    else:
+                        try:
+                            await self._rename_managed_radio_item(existing, ma_name)
+                            synced += 1
+                            desired_ready = True
+                        except Exception as exc:
+                            add_failures += 1
+                            if len(failed_radios) < 25:
+                                failed_radios.append({"name": channel.name, "url": url, "error": exception_detail(exc)[:300]})
+                            LOGGER.warning("Could not rename MA radio %s: %s", ma_name, exception_detail(exc))
                 else:
                     args: dict[str, Any] = {"url": url, "name": ma_name}
                     if IMPORT_LOGOS and channel.logo:
@@ -1834,7 +1865,7 @@ class MusicAssistantSyncService:
                         add_failures += 1
                         if len(failed_radios) < 25:
                             failed_radios.append({"name": channel.name, "url": url, "error": exception_detail(exc)[:300]})
-                        LOGGER.warning("Could not add/update MA radio %s: %s", ma_name, exception_detail(exc))
+                        LOGGER.warning("Could not add MA radio %s: %s", ma_name, exception_detail(exc))
 
                 # Format migration is independent of MA_REMOVE_MISSING. Only remove
                 # the old format after the desired station is confirmed present so

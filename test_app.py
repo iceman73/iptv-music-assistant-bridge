@@ -1175,3 +1175,89 @@ def test_v610_genre_links_only_desired_managed_radios():
             app.MA_MANAGED_URL_PREFIX = old_prefix
 
     asyncio.run(run())
+
+
+def test_v611_existing_managed_radio_is_renamed_with_update_api():
+    async def run():
+        service = app.MusicAssistantSyncService()
+        old_prefix = app.MA_NAME_PREFIX
+        try:
+            app.MA_NAME_PREFIX = "SXM - "
+            item = {
+                "item_id": "123",
+                "name": "Classic Vinyl",
+                "sort_name": "classic vinyl",
+                "provider": "library",
+                "provider_mappings": [{
+                    "provider_domain": "builtin",
+                    "provider_instance": "builtin",
+                    "item_id": "http://bridge/stream/xc-1.mp3",
+                }],
+                "metadata": {"images": []},
+            }
+            calls = []
+
+            async def fake_call(command, args):
+                calls.append((command, args))
+                return None
+
+            service._call = fake_call
+            await service._rename_managed_radio_item(item, "SXM - Classic Vinyl")
+            assert calls[0][0] == "music/radios/update"
+            args = calls[0][1]
+            assert args["item_id"] == 123
+            assert args["overwrite"] is True
+            assert args["update"]["name"] == "SXM - Classic Vinyl"
+            assert "sort_name" not in args["update"]
+            assert args["update"]["provider_mappings"] == item["provider_mappings"]
+        finally:
+            app.MA_NAME_PREFIX = old_prefix
+
+    asyncio.run(run())
+
+
+def test_v611_sync_renames_matching_url_instead_of_readding():
+    async def run():
+        service = app.MusicAssistantSyncService()
+        old_genre = app.MA_GENRE_ENABLED
+        old_prefix = app.MA_NAME_PREFIX
+        try:
+            app.MA_GENRE_ENABLED = False
+            app.MA_NAME_PREFIX = "SXM - "
+            ch = Channel(channel_id="xc-1", name="Classic Vinyl", source_url="http://source.test/1.ts")
+            url = ch.bridge_url(app.IMPORT_FORMAT)
+            existing = {
+                "item_id": "123",
+                "name": "Classic Vinyl",
+                "provider_mappings": [{
+                    "provider_domain": "builtin",
+                    "provider_instance": "builtin",
+                    "item_id": url,
+                }],
+            }
+            renamed = []
+            added = []
+
+            async def fake_managed():
+                return [existing]
+
+            async def fake_rename(item, name):
+                renamed.append((item["item_id"], name))
+
+            async def fake_add(channel, args):
+                added.append(args)
+
+            service._managed_library_radios = fake_managed
+            service._rename_managed_radio_item = fake_rename
+            service._add_radio_with_warm_source = fake_add
+
+            result = await service.sync([ch], reason="rename-test")
+            assert renamed == [("123", "SXM - Classic Vinyl")]
+            assert added == []
+            assert result["synced_count"] == 1
+            assert result["unchanged_count"] == 0
+        finally:
+            app.MA_GENRE_ENABLED = old_genre
+            app.MA_NAME_PREFIX = old_prefix
+
+    asyncio.run(run())
