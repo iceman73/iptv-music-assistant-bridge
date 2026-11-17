@@ -1261,3 +1261,50 @@ def test_v611_sync_renames_matching_url_instead_of_readding():
             app.MA_NAME_PREFIX = old_prefix
 
     asyncio.run(run())
+
+
+def test_v612_metadata_delay_holds_new_song_until_due():
+    old_delay = app.METADATA_DELAY_SECONDS
+    try:
+        app.METADATA_DELAY_SECONDS = 15.0
+        service = app.MetadataService()
+        channel = Channel(channel_id="xc-1", name="Classic Vinyl", channel_number="26")
+        old_song = app.NowPlaying(
+            provider="ticker", channel_name="Classic Vinyl", channel_number="26",
+            artist="Old Artist", title="Old Song", fetched_at=time.time(),
+        )
+        new_song = app.NowPlaying(
+            provider="ticker", channel_name="Classic Vinyl", channel_number="26",
+            artist="New Artist", title="New Song", fetched_at=time.time(),
+        )
+
+        # Seed the currently published metadata, then queue the next provider snapshot.
+        service._publish_cache([old_song])
+        service._replace_cache([new_song])
+        assert service.get(channel).title == "Old Song"
+        assert len(service._pending_metadata) == 1
+
+        # Make the queued snapshot due without sleeping in the test.
+        _, items = service._pending_metadata.popleft()
+        service._pending_metadata.appendleft((time.monotonic() - 0.01, items))
+        assert service.get(channel).title == "New Song"
+        assert len(service._pending_metadata) == 0
+    finally:
+        app.METADATA_DELAY_SECONDS = old_delay
+
+
+def test_v612_metadata_delay_zero_publishes_immediately():
+    old_delay = app.METADATA_DELAY_SECONDS
+    try:
+        app.METADATA_DELAY_SECONDS = 0
+        service = app.MetadataService()
+        channel = Channel(channel_id="xc-1", name="Classic Vinyl", channel_number="26")
+        song = app.NowPlaying(
+            provider="ticker", channel_name="Classic Vinyl", channel_number="26",
+            artist="Artist", title="Song", fetched_at=time.time(),
+        )
+        service._replace_cache([song])
+        assert service.get(channel).title == "Song"
+        assert len(service._pending_metadata) == 0
+    finally:
+        app.METADATA_DELAY_SECONDS = old_delay

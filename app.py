@@ -25,7 +25,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("dispatcharr-ma-bridge")
 
 APP_NAME = "Dispatcharr / XC Music Assistant Bridge"
-APP_VERSION = "6.1.1"
+APP_VERSION = "6.1.2"
 SOURCE_MODE = os.getenv("SOURCE_MODE", "dispatcharr").strip().lower()
 
 DISPATCHARR_BASE_URL = os.getenv("DISPATCHARR_BASE_URL", "http://dispatcharr:9191").rstrip("/")
@@ -72,6 +72,7 @@ STELLAR_BASE_URL = os.getenv("STELLAR_BASE_URL", "https://api.stellartunerlog.co
 STELLAR_API_KEY = os.getenv("STELLAR_API_KEY", "").strip()
 STELLAR_POLL_SECONDS = max(15, int(os.getenv("STELLAR_POLL_SECONDS", "30")))
 METADATA_STALE_SECONDS = max(60, int(os.getenv("METADATA_STALE_SECONDS", "600")))
+METADATA_DELAY_SECONDS = max(0.0, float(os.getenv("METADATA_DELAY_SECONDS", "15")))
 # Ticker integration (v5.2). This intentionally uses the same free bulk feeds
 # as the current Dispatcharr Ticker plugin, without enabling Ticker overlays.
 TICKER_NOWPLAYING_URL = os.getenv("TICKER_NOWPLAYING_URL", "https://stellartunerlog.com/nowplaying.json").strip()
@@ -2016,6 +2017,8 @@ class MetadataService:
         self._ticker_polling_active = False
         self._icy_by_number: dict[str, bytes] = {}
         self._icy_by_name: dict[str, bytes] = {}
+        self._pending_metadata: deque[tuple[float, list[NowPlaying]]] = deque()
+        self.last_source_update = ""
 
     def _select_provider(self) -> str:
         if not METADATA_ENABLED:
@@ -2108,7 +2111,8 @@ class MetadataService:
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
 
-    def _replace_cache(self, items: list[NowPlaying]) -> None:
+    def _publish_cache(self, items: list[NowPlaying]) -> None:
+        """Atomically publish one metadata snapshot to API and ICY consumers."""
         by_number: dict[str, NowPlaying] = {}
         by_name: dict[str, NowPlaying] = {}
         for item in items:
@@ -2133,7 +2137,37 @@ class MetadataService:
         self._icy_by_number = icy_by_number
         self._icy_by_name = icy_by_name
         self.last_update = utc_now_iso()
-        LOGGER.info("Metadata cache updated from %s with %d channel(s)", self.provider, len(items))
+        LOGGER.info(
+            "Metadata cache published from %s with %d channel(s) after %.1fs delay",
+            self.provider,
+            len(items),
+            METADATA_DELAY_SECONDS,
+        )
+
+    def _promote_delayed_metadata(self) -> None:
+        """Publish every queued snapshot whose configured delay has elapsed."""
+        now = time.monotonic()
+        while self._pending_metadata and self._pending_metadata[0][0] <= now:
+            _, items = self._pending_metadata.popleft()
+            self._publish_cache(items)
+
+    def _replace_cache(self, items: list[NowPlaying]) -> None:
+        """Queue provider metadata for delayed publication, or publish immediately."""
+        self.last_source_update = utc_now_iso()
+        if METADATA_DELAY_SECONDS <= 0:
+            self._publish_cache(items)
+            return
+        release_at = time.monotonic() + METADATA_DELAY_SECONDS
+        self._pending_metadata.append((release_at, items))
+        # Promote anything already due. This also bounds the queue naturally
+        # when provider refreshes continue at a steady cadence.
+        self._promote_delayed_metadata()
+        LOGGER.debug(
+            "Queued metadata snapshot from %s for publication in %.1fs (%d pending)",
+            self.provider,
+            METADATA_DELAY_SECONDS,
+            len(self._pending_metadata),
+        )
 
     async def _refresh_xm_station_catalog(self, client: httpx.AsyncClient) -> None:
         if self._xm_stations_by_id and time.monotonic() - self._xm_station_refresh < 6 * 3600:
@@ -2373,6 +2407,7 @@ class MetadataService:
         self._replace_cache(items)
 
     def get(self, channel: Channel) -> NowPlaying | None:
+        self._promote_delayed_metadata()
         item = None
         if channel.channel_number:
             item = self.items_by_number.get(clean_channel_number(channel.channel_number))
@@ -2397,9 +2432,13 @@ class MetadataService:
         return self._icy_by_name.get(normalize_name(channel.name))
 
     def status(self) -> dict[str, Any]:
+        self._promote_delayed_metadata()
         return {
             "enabled": METADATA_ENABLED,
             "icy_metadata_enabled": ICY_METADATA_ENABLED,
+            "metadata_delay_seconds": METADATA_DELAY_SECONDS,
+            "pending_metadata_snapshots": len(self._pending_metadata),
+            "last_source_update": self.last_source_update,
             "provider": self.provider,
             "active_source": self.active_source,
             "fallback_provider": self.fallback_provider if self.provider == "ticker" else "",
@@ -3118,6 +3157,7 @@ def _check_bridge_local() -> dict[str, Any]:
         "status": "ok" if (not cache or writable) else "warn", "version": APP_VERSION,
         "catalog_channels": len(catalog.channels), "cache_file": str(cache) if cache else "", "cache_parent_writable": writable if cache else None,
         "metadata_provider": metadata_service.provider, "metadata_active_source": metadata_service.active_source,
+        "metadata_delay_seconds": METADATA_DELAY_SECONDS,
         "icy_metadata_enabled": ICY_METADATA_ENABLED, "icy_metaint": ICY_METAINT,
         "stream_coalesce_bytes": STREAM_COALESCE_BYTES,
         "stream_coalesce_max_seconds": STREAM_COALESCE_MAX_SECONDS,
@@ -3184,6 +3224,7 @@ async def health():
             "upstream_startup_timeout_seconds": UPSTREAM_STARTUP_TIMEOUT_SECONDS,
             "icy_metadata_enabled": ICY_METADATA_ENABLED,
             "icy_metaint": ICY_METAINT,
+            "metadata_delay_seconds": METADATA_DELAY_SECONDS,
             "source_rw_timeout_seconds": SOURCE_RW_TIMEOUT_SECONDS,
             "aac_mode": AAC_MODE,
             "aac_bitrate": AAC_BITRATE,

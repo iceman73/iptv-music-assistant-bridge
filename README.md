@@ -2,7 +2,7 @@
 
 A Docker bridge that turns Dispatcharr or Xtream Codes audio channels into stable radio streams for Music Assistant. The default path is tuned for Amazon Echo playback.
 
-**Current release: v6.1.1**
+**Current release: v6.1.2**
 
 v6 is based on the playback path validated in v5.6.13. v6.0.2 restores that validated FFmpeg/transcode path after the v6.0.1 async-resample experiment caused renewed stuttering. The old Python MP3 pacing, adaptive jitter buffer, learned jitter state, post-start silence gap-fill, and async-resample experiment are not part of the active playback path.
 
@@ -283,6 +283,16 @@ The bridge stores its persistent cache at `/data/bridge-cache.json`.
 | `TICKER_ACTIVE_POLL_SECONDS` | `15` | Poll rate while bridge streams are active |
 | `TICKER_IDLE_POLL_SECONDS` | `0` | Ticker polling while no bridge stream is active |
 | `XMPLAYLIST_POLL_SECONDS` | `120` | xmplaylist refresh interval |
+
+### v6.1.2 metadata/audio alignment
+
+v6.1.2 adds a configurable metadata publication delay so song-title changes can be aligned with buffered audio reaching Music Assistant/Echo. Provider metadata is still fetched immediately; only publication to the metadata API and ICY consumers is delayed.
+
+```env
+METADATA_DELAY_SECONDS=15
+```
+
+Set it to `0` for the previous immediate behavior. `/health`, `/metadata/<channel-id>`, and metadata status expose the configured delay and publication state.
 
 ### v6.1.1 Music Assistant rename fix
 
