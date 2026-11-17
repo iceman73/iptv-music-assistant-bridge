@@ -451,12 +451,17 @@ def test_ticker_status_reports_active_and_idle_poll_intervals():
         app.TICKER_IDLE_POLL_SECONDS = old_idle
 
 def test_icy_cache_is_prebuilt_and_network_free():
-    svc = MetadataService()
-    item = app.NowPlaying(provider="ticker", channel_name="Classic Vinyl", artist="Fleetwood Mac", title="Dreams", fetched_at=app.time.time())
-    svc._replace_cache([item])
-    ch = Channel(channel_id="xc-1", name="Classic Vinyl")
-    block = svc.get_icy_block(ch)
-    assert isinstance(block, bytes)
+    old_delay = app.METADATA_DELAY_SECONDS
+    try:
+        app.METADATA_DELAY_SECONDS = 0
+        svc = MetadataService()
+        item = app.NowPlaying(provider="ticker", channel_name="Classic Vinyl", artist="Fleetwood Mac", title="Dreams", fetched_at=app.time.time())
+        svc._replace_cache([item])
+        ch = Channel(channel_id="xc-1", name="Classic Vinyl")
+        block = svc.get_icy_block(ch)
+        assert isinstance(block, bytes)
+    finally:
+        app.METADATA_DELAY_SECONDS = old_delay
     assert b"Fleetwood Mac - Dreams" in block
 
 def test_icy_wrapper_exact_audio_byte_accounting():
